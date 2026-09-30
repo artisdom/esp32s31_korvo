@@ -53,15 +53,20 @@ impl Display {
             return Err("framebuffer must be 64-byte aligned and 768000 bytes");
         }
 
-        // HSYNC/VSYNC active-low pulses, data clocked on the falling PCLK
-        // edge (matches `pclk_active_neg = true` in the stock BSP).
+        // HSYNC/VSYNC idle high (active-low pulses). The panel latches data
+        // on the falling PCLK edge - the BSP's `pclk_active_neg = true`,
+        // which maps to Phase::ShiftHigh in esp-hal.
         let timing = FrameTiming {
             horizontal_total_width: b::LCD_H_RES
                 + b::LCD_HSYNC_BACK_PORCH
-                + b::LCD_HSYNC_FRONT_PORCH,
+                + b::LCD_HSYNC_FRONT_PORCH
+                + b::LCD_HSYNC_PULSE_WIDTH,
             horizontal_blank_front_porch: b::LCD_HSYNC_BACK_PORCH + b::LCD_HSYNC_PULSE_WIDTH,
             horizontal_active_width: b::LCD_H_RES,
-            vertical_total_height: b::LCD_V_RES + b::LCD_VSYNC_BACK_PORCH + b::LCD_VSYNC_FRONT_PORCH,
+            vertical_total_height: b::LCD_V_RES
+                + b::LCD_VSYNC_BACK_PORCH
+                + b::LCD_VSYNC_FRONT_PORCH
+                + b::LCD_VSYNC_PULSE_WIDTH,
             vertical_blank_front_porch: b::LCD_VSYNC_BACK_PORCH + b::LCD_VSYNC_PULSE_WIDTH,
             vertical_active_height: b::LCD_V_RES,
             vsync_width: b::LCD_VSYNC_PULSE_WIDTH,
@@ -73,7 +78,7 @@ impl Display {
             .with_frequency(Rate::from_hz(b::LCD_PIXEL_CLOCK_HZ))
             .with_clock_mode(ClockMode {
                 polarity: Polarity::IdleLow,
-                phase: Phase::ShiftLow,
+                phase: Phase::ShiftHigh,
             })
             .with_timing(timing)
             .with_format(dpi::Format {

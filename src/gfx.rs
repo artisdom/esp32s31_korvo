@@ -4,6 +4,21 @@ use crate::font::FONT;
 
 pub type Color = u16;
 
+/// A rectangular region of the framebuffer (used for partial cache cleans).
+#[derive(Clone, Copy)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Rect {
+    pub fn new(x: usize, y: usize, w: usize, h: usize) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
 pub const fn rgb565(r: u8, g: u8, b: u8) -> Color {
     (((r as u16) & 0xf8) << 8) | (((g as u16) & 0xfc) << 3) | ((b as u16) >> 3)
 }
@@ -115,6 +130,25 @@ impl<'a> Canvas<'a> {
                         (cy as i32 + dy).max(0) as usize,
                         c,
                     );
+                }
+            }
+        }
+    }
+
+    /// XOR-draw a ring (self-inverse: drawing again erases it).
+    pub fn xor_ring(&mut self, cx: usize, cy: usize, r: usize) {
+        let r2 = (r * r) as i32;
+        let inner = ((r - 1) * (r - 1)) as i32;
+        for dy in -(r as i32)..=(r as i32) {
+            for dx in -(r as i32)..=(r as i32) {
+                let d2 = dx * dx + dy * dy;
+                if d2 <= r2 && d2 >= inner {
+                    let x = (cx as i32 + dx).max(0) as usize;
+                    let y = (cy as i32 + dy).max(0) as usize;
+                    if x < self.width && y < self.height {
+                        let p = &mut self.pixels[y * self.width + x];
+                        *p ^= 0xFFFF;
+                    }
                 }
             }
         }

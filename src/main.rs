@@ -268,6 +268,11 @@ async fn main(_spawner: embassy_executor::Spawner) {
     };
 
     let start = Instant::now();
+    let mut shown_page = st.page;
+    let mut dyn_tick = Instant::now();
+    // Draw the first page immediately.
+    ui::draw(&mut display.canvas(), &st);
+    display.flush();
     let mut frame = 0u32;
     let mut fps_window = Instant::now();
     let mut fps = 0u32;
@@ -331,8 +336,18 @@ async fn main(_spawner: embassy_executor::Spawner) {
         st.heap_free = st.psram_free; // single heap: regions combined
 
         // ---- redraw ----
-        ui::draw(&mut display.canvas(), &st);
-        display.flush();
+        // Full redraw only when the page changes; otherwise repaint just
+        // the dynamic widgets and cache-clean those regions (a full-frame
+        // clean every tick starves the LCD DMA and the panel rolls).
+        if shown_page != st.page {
+            shown_page = st.page;
+            ui::draw(&mut display.canvas(), &st);
+            display.flush();
+        } else if dyn_tick.elapsed().as_millis() >= 50 {
+            dyn_tick = Instant::now();
+            let dirty = ui::draw_dynamic(&mut display.canvas(), &st);
+            display.flush_rects(&dirty.as_slice());
+        }
 
         // ---- status LED: slow colour cycle, orange flash on key press ----
         led_phase = led_phase.wrapping_add(2);

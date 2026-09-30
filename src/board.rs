@@ -65,14 +65,19 @@ pub const LCD_VSYNC: u8 = 45;
 
 pub const LCD_H_RES: usize = 800;
 pub const LCD_V_RES: usize = 480;
-/// 26 MHz PCLK, ~60 Hz refresh (matches the BSP timing).
-pub const LCD_PIXEL_CLOCK_HZ: u32 = 26_000_000;
-pub const LCD_HSYNC_PULSE_WIDTH: usize = 1;
+// Panel: ST7262E43 (4.3" 800x480 RGB, same as ESP32-S3-LCD-EV-Board SUB3).
+// Timing from Espressif's `SUB_BOARD3_800_480_PANEL_35HZ_RGB_TIMING`:
+// 18 MHz PCLK (~35 Hz refresh), data latched on the falling PCLK edge.
+// NOTE: the Korvo S31 BSP's display.h carries different numbers
+// (26 MHz, 1/40/20, 1/10/5) which do NOT lock this panel - the image
+// rolls vertically with a 1-line VSYNC the ST7262E43 can't see.
+pub const LCD_PIXEL_CLOCK_HZ: u32 = 18_000_000;
+pub const LCD_HSYNC_PULSE_WIDTH: usize = 40;
 pub const LCD_HSYNC_BACK_PORCH: usize = 40;
-pub const LCD_HSYNC_FRONT_PORCH: usize = 20;
-pub const LCD_VSYNC_PULSE_WIDTH: usize = 1;
-pub const LCD_VSYNC_BACK_PORCH: usize = 10;
-pub const LCD_VSYNC_FRONT_PORCH: usize = 5;
+pub const LCD_HSYNC_FRONT_PORCH: usize = 48;
+pub const LCD_VSYNC_PULSE_WIDTH: usize = 23;
+pub const LCD_VSYNC_BACK_PORCH: usize = 32;
+pub const LCD_VSYNC_FRONT_PORCH: usize = 13;
 
 /// GT1151 capacitive touch controller, 7-bit I2C addresses to probe.
 pub const GT1151_I2C_ADDRS: [u8; 2] = [0x14, 0x5d];

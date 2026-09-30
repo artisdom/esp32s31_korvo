@@ -31,9 +31,11 @@ use esp_hal::{
 use crate::board as b;
 use crate::gfx::{Canvas, Color};
 
-/// 800*480*2 bytes; split into <=4092-byte chunks => 188 descriptors.
+/// 800*480*2 bytes. Descriptor chunks are sized in multiples of the DMA
+/// burst length (64 bytes) and under the 4095-byte descriptor limit:
+/// 4032 = 63*64 bytes each, 191 descriptors in total.
 const FB_LEN: usize = b::LCD_H_RES * b::LCD_V_RES * 2;
-const MAX_CHUNK: usize = 4092;
+const MAX_CHUNK: usize = 4032;
 const DESC_COUNT: usize = (FB_LEN + MAX_CHUNK - 1) / MAX_CHUNK;
 
 pub struct Display {
@@ -161,6 +163,34 @@ impl Display {
         Canvas::new(px, b::LCD_H_RES, b::LCD_V_RES)
     }
 
+    /// Clean the data cache over the given regions only.
+    ///
+    /// A full-framebuffer clean every frame competes with the LCD DMA for
+    /// PSRAM bandwidth and the panel loses sync; touching only the regions
+    /// that were actually redrawn keeps the writeback traffic negligible.
+    pub fn flush_rects(&mut self, rects: &[crate::gfx::Rect]) {
+        const LINE: usize = b::LCD_H_RES * 2; // bytes per row
+        for r in rects {
+            let x0 = (r.x * 2) & !63; // 64-byte cacheline alignment
+            let x1 = ((r.x + r.w) * 2 + 63) & !63;
+            let start = r.y * LINE + x0;
+            let end = (r.y + r.h) * LINE + x1;
+            let end = end.min(self.fb.len());
+            if end <= start {
+                continue;
+            }
+            // SAFETY: the wrapper only observes the exclusively-owned
+            // framebuffer region; writeback is a pure cache clean.
+            let mut region: DmaAlignedMut<'_, [u8]> = unsafe {
+                DmaAlignedMut::new_unchecked(core::slice::from_raw_parts_mut(
+                    self.fb.as_mut_ptr().add(start),
+                    end - start,
+                ))
+            };
+            region.writeback();
+        }
+    }
+
     /// Clean the data cache covering the framebuffer so the DMA engine
     /// observes the latest CPU writes.
     pub fn flush(&mut self) {
@@ -272,7 +302,13 @@ unsafe impl DmaTxBuffer for FrameRing {
             // The framebuffer lives in PSRAM and the LCD_CAM uses the
             // AXI GDMA engine, which can access it.
             accesses_psram: true,
-            burst_transfer: Default::default(),
+            // 64-byte PSRAM bursts (the stock BSP uses 128-byte DMA bursts
+            // for this panel; esp-hal's default of 16-byte bursts starves
+            // the LCD FIFO and the image drifts horizontally).
+            burst_transfer: esp_hal::dma::BurstConfig {
+                external_memory: esp_hal::dma::ExternalBurstConfig::Size64,
+                internal_memory: esp_hal::dma::InternalBurstConfig::Enabled,
+            },
             check_owner: Some(false),
             auto_write_back: false,
         }

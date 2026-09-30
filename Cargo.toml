@@ -1,0 +1,41 @@
+[package]
+name    = "korvo-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Embassy async runtime --------------------------------------------------
+embassy-executor = "0.10"
+embassy-futures  = "0.1"
+embassy-sync     = "0.8"
+embassy-time     = "0.4"
+embassy-usb      = { version = "0.6", default-features = false }
+
+# esp-rs stack ------------------------------------------------------------
+# esp-hal stable (1.2.x) does not contain ESP32-S31 support yet: the I2S,
+# LCD_CAM (RGB panel + DVP camera) and USB-HS drivers for this chip live on
+# `main` and are expected in the next minor release. Pin everything to the
+# same revision of the esp-hal repository so the intra-repo crates stay
+# compatible.
+esp-hal = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-hal", features = ["esp32s31", "unstable"] }
+esp-backtrace = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-backtrace", features = ["esp32s31", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-bootloader-esp-idf", features = ["esp32s31"] }
+esp-rtos = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-rtos", features = ["esp32s31", "embassy"] }
+esp-println = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-println", default-features = false, features = ["esp32s31", "uart", "critical-section"] }
+esp-alloc = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-alloc", features = ["esp32s31"] }
+
+# SD/MMC card protocol + FAT filesystem -----------------------------------
+sdio                = "0.5"
+block-device-driver = "0.2"
+aligned             = "0.4"
+
+static_cell = "2"
+heapless    = "0.8"
+libm        = "0.2"
+
+[profile.release]
+debug            = true
+debug-assertions = true
+lto              = "fat"
+codegen-units    = 1

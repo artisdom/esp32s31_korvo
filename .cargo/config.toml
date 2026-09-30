@@ -1,0 +1,19 @@
+[target.riscv32imafc-unknown-none-elf]
+runner = "espflash flash --monitor --baud 921600 --log-format serial --port /dev/ttyUSB0"
+# esp-hal's linkall.x pulls in memory.x, the chip script, hal-defaults.x and
+# (via hal-defaults.x) the PAC's device.x. riscv-rt 0.16 requires the app to
+# pass the entry script itself.
+rustflags = [
+    # Matches upstream CI: linkall.x pulls in memory.x, the chip script,
+    # hal-defaults.x (and the PAC's device.x through it).
+    "-C", "link-arg=-Tlinkall.x",
+    # readable backtraces via esp-backtrace
+    "-C", "force-frame-pointers",
+]
+
+[build]
+target      = "riscv32imafc-unknown-none-elf"
+incremental = false
+
+[env]
+ESP_LOG = "info"

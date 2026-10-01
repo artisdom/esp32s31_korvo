@@ -45,15 +45,43 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// Main-loop heartbeat, readable from the USB task on core 1.
 static LOOP_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Panel phase offsets measured at boot (see the boot calibration):
+/// the ST7262E43 locks to the DPI stream with a random phase on every
+/// power-up, so the framebuffer is rotated by (x, y) to compensate.
+static CAL_OFFSET_X: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static CAL_OFFSET_Y: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+static BOOT_T0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn step(msg: &str) {
+    let t0 = BOOT_T0.load(Ordering::Relaxed);
+    let now = esp_hal::time::Instant::now().elapsed().as_millis() as u32;
+    // t0 is captured on first call
+    let base = if t0 == 0 {
+        BOOT_T0.store(now, Ordering::Relaxed);
+        now
+    } else {
+        t0
+    };
+    println!("[{:>5} ms] {}", now - base, msg);
+}
+
+#[embassy_executor::task]
+async fn bounce_task() {
+    loop {
+        display::service_bounce();
+        embassy_time::Timer::after(embassy_time::Duration::from_micros(200)).await;
+    }
+}
+
 #[esp_hal::main]
-async fn main(_spawner: embassy_executor::Spawner) {
+async fn main(spawner: embassy_executor::Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    println!("== ESP32-S31-Korvo-1 Rust demo ==");
+    step("== ESP32-S31-Korvo-1 Rust demo ==");
     println!("chip: {}", esp_hal::chip!());
 
     // --- heaps: internal DRAM + PSRAM regions --------------------------------
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 12 * 1024);
     let psram = esp_hal::psram::Psram::new(peripherals.PSRAM, esp_hal::psram::PsramConfig::default());
     let (_psram_start, psram_size) = psram.raw_parts();
     unsafe {
@@ -63,16 +91,61 @@ async fn main(_spawner: embassy_executor::Spawner) {
             esp_alloc::MemoryCapability::External.into(),
         ));
     }
-    println!("heap: +64k DRAM +{} MiB PSRAM", psram_size / (1024 * 1024));
+    step("heap ready");
 
     // --- timers / RTOS ----------------------------------------------------------
-    println!("init: timer/rtos...");
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
-    println!("init: rtos ok");
+    step("rtos ok");
+    // --- RGB LCD + PSRAM framebuffer ---------------------------------------------------
+    let fb: &'static mut [u8] = alloc_fb().expect("framebuffer alloc");
+    let lcd_pins = display::LcdPins {
+        vsync: peripherals.GPIO45,
+        hsync: peripherals.GPIO44,
+        de: peripherals.GPIO43,
+        pclk: peripherals.GPIO40,
+        d0: peripherals.GPIO8,
+        d1: peripherals.GPIO9,
+        d2: peripherals.GPIO10,
+        d3: peripherals.GPIO11,
+        d4: peripherals.GPIO12,
+        d5: peripherals.GPIO13,
+        d6: peripherals.GPIO14,
+        d7: peripherals.GPIO15,
+        d8: peripherals.GPIO16,
+        d9: peripherals.GPIO17,
+        d10: peripherals.GPIO18,
+        d11: peripherals.GPIO19,
+        d12: peripherals.GPIO33,
+        d13: peripherals.GPIO34,
+        d14: peripherals.GPIO35,
+        d15: peripherals.GPIO36,
+    };
+    let lcd_cam = esp_hal::lcd_cam::LcdCam::new(peripherals.LCD_CAM);
+    let mut display =
+        match display::Display::new(lcd_cam, peripherals.DMA_AXI_CH0, fb, lcd_pins) {
+            Ok(d) => {
+                step("LCD scanning");
+                d
+            }
+            Err(e) => panic!("display init failed: {}", e),
+        };
+
+    // Bounce-ring refill task: must run far faster than one ring cycle
+    // (~2.7 ms); writing a segment mid-stream corrupts the picture.
+    spawner.spawn(bounce_task().expect("spawn bounce"));
+    step("bounce task spawned");
+    {
+        let mut c = display.canvas();
+        c.fill(gfx::WHITE);
+        c.text(300, 230, "BOOTING...", gfx::BLACK, 2);
+    }
+    display.flush();
+    step("splash shown");
+
 
     // --- boot blip on the WS2812 -------------------------------------------------
-    println!("init: rmt...");
+    step("rmt");
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(10))
         .expect("RMT clock");
     let mut led = led::StatusLed::new(
@@ -80,7 +153,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         peripherals.GPIO37,
     )
     .expect("LED channel");
-    println!("init: led ok");
+    step("led ok");
     led.send(0, 0, 32);
 
     // --- shared I2C bus (codec + touch + camera SCCB) ------------------------------
@@ -91,7 +164,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
     .expect("I2C0")
     .with_sda(peripherals.GPIO0)
     .with_scl(peripherals.GPIO1);
-    println!("init: i2c ok");
+    step("i2c ok");
     {
         // Bus scan for bring-up diagnostics.
         let mut found = heapless::String::<96>::new();
@@ -111,7 +184,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let pa_pin = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
     let mut codec = es8389::Es8389::new(i2c, Some(pa_pin));
     let codec_ok = codec.ping();
-    println!("ES8389 codec: {}", if codec_ok { "detected" } else { "MISSING" });
+    step(if codec_ok { "codec detected" } else { "codec MISSING" });
     let codec_id = if codec_ok {
         match codec.init_48k() {
             Ok(()) => {
@@ -145,7 +218,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         };
         match audio::Audio::new(i2s, pins) {
             Ok(a) => {
-                println!("I2S0 DMA streaming started (TX+RX)");
+                step("i2s streaming");
                 a
             }
             Err(e) => panic!("audio init failed: {}", e),
@@ -153,39 +226,6 @@ async fn main(_spawner: embassy_executor::Spawner) {
     };
     audio.set_source(Source::Chime); // startup arpeggio
 
-    // --- RGB LCD + PSRAM framebuffer ---------------------------------------------------
-    let fb: &'static mut [u8] = alloc_fb().expect("framebuffer alloc");
-    let lcd_pins = display::LcdPins {
-        vsync: peripherals.GPIO45,
-        hsync: peripherals.GPIO44,
-        de: peripherals.GPIO43,
-        pclk: peripherals.GPIO40,
-        d0: peripherals.GPIO8,
-        d1: peripherals.GPIO9,
-        d2: peripherals.GPIO10,
-        d3: peripherals.GPIO11,
-        d4: peripherals.GPIO12,
-        d5: peripherals.GPIO13,
-        d6: peripherals.GPIO14,
-        d7: peripherals.GPIO15,
-        d8: peripherals.GPIO16,
-        d9: peripherals.GPIO17,
-        d10: peripherals.GPIO18,
-        d11: peripherals.GPIO19,
-        d12: peripherals.GPIO33,
-        d13: peripherals.GPIO34,
-        d14: peripherals.GPIO35,
-        d15: peripherals.GPIO36,
-    };
-    let lcd_cam = esp_hal::lcd_cam::LcdCam::new(peripherals.LCD_CAM);
-    let (mut display, _keep_alive) =
-        match display::Display::new(lcd_cam, peripherals.DMA_AXI_CH0, fb, lcd_pins) {
-            Ok(d) => {
-                println!("RGB LCD scanning from PSRAM ring buffer");
-                d
-            }
-            Err(e) => panic!("display init failed: {}", e),
-        };
 
     // --- touch ---------------------------------------------------------------------------
     let mut touch = touch::Touch::probe(i2c);
@@ -214,7 +254,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         d2: peripherals.GPIO22,
         d3: peripherals.GPIO23,
     };
-    println!("mounting microSD...");
+    step("mounting microSD...");
     let sd = sdcard::mount_and_inspect(peripherals.SDHOST, sd_pins, sd_power).await;
     if sd.card_ok {
         println!(
@@ -227,7 +267,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
 
     // --- buttons -------------------------------------------------------------------------------
     let mut buttons = buttons::Buttons::new(peripherals.ADC1, peripherals.GPIO42);
-    println!("init: buttons ok");
+    step("buttons ok");
 
     // --- USB CDC task on core 1 -------------------------------------------------------------------
     static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
@@ -240,7 +280,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
             spawner.spawn(usb::usb_task(usb_hs).expect("spawn usb"));
         });
     });
-    println!("core 1: USB CDC task running");
+    step("core1 usb task");
 
     // --- app state ----------------------------------------------------------------------------------
     let mut st = ui::AppStatus {
@@ -267,12 +307,19 @@ async fn main(_spawner: embassy_executor::Spawner) {
         flash_led: false,
     };
 
+    lcd_calibrate(&mut display, touch.as_mut(), &st, &mut core::sync::atomic::AtomicBool::new(false)).await;
+
     let start = Instant::now();
-    let mut shown_page = st.page;
+    let mut touch_seen = 0u32;
+    // Force a full page draw on the first loop iteration: the calibration
+    // screen is still in the framebuffer, and the loop only repaints
+    // dynamic widgets afterwards.
+    let mut shown_page = if st.page == Page::Home {
+        Page::Audio
+    } else {
+        Page::Home
+    };
     let mut dyn_tick = Instant::now();
-    // Draw the first page immediately.
-    ui::draw(&mut display.canvas(), &st);
-    display.flush();
     let mut frame = 0u32;
     let mut fps_window = Instant::now();
     let mut fps = 0u32;
@@ -313,10 +360,18 @@ async fn main(_spawner: embassy_executor::Spawner) {
         st.btn_held = buttons.held();
 
         // ---- touch ----
+        // st.touch_point stays in PANEL space (the cursor is drawn
+        // unrotated so it lands under the finger); hit-testing converts
+        // into framebuffer space.
         if let Some(t) = touch.as_mut() {
             st.touch_point = t.poll().map(|p| (p.x, p.y));
+            if st.touch_point.is_some() && touch_seen < 3 {
+                touch_seen += 1;
+                println!("touch: {:?}", st.touch_point);
+            }
             if let Some((x, y)) = st.touch_point {
-                if let Some(page) = ui::hit_tabs(x, y) {
+                let (fx, fy) = touch_to_fb(x, y);
+                if let Some(page) = ui::hit_tabs(fx, fy) {
                     st.page = page;
                 }
             }
@@ -384,6 +439,119 @@ async fn main(_spawner: embassy_executor::Spawner) {
 
         Timer::after(Duration::from_millis(2)).await;
     }
+}
+
+/// Boot calibration: the panel locks to the DPI stream with a random
+/// phase each power-up. Draw a crosshair at framebuffer (400, 240), ask
+/// the user to touch where it *appears*, and rotate the framebuffer by
+/// the measured delta so subsequent drawing lines up with the glass.
+/// Touch coordinates are panel-space, so the same offsets map them back
+/// into framebuffer space.
+async fn lcd_calibrate(
+    display: &mut display::Display,
+    mut touch: Option<&mut touch::Touch>,
+    st: &ui::AppStatus,
+    _self_restart: &mut core::sync::atomic::AtomicBool,
+) {
+    // Animated screen: the panel is suspected of showing a stale early
+    // frame, so the calibration screen flips black/white with a counter
+    // every 3 s. Whatever the user reports seeing settles it.
+    let mut flip: u32 = 0;
+    step("LCD cal: touch the visible crosshair (5 min timeout)");
+
+    let cal_start = esp_hal::time::Instant::now();
+    let mut stable: Option<(u16, u16)> = None;
+    let mut stable_count = 0u32;
+    let mut last_dbg = 0u64;
+
+    while cal_start.elapsed().as_secs() < 300 {
+        let t_ms = cal_start.elapsed().as_millis() as u64;
+        if t_ms / 1000 != last_dbg {
+            last_dbg = t_ms / 1000;
+            let (st, sv) = display::bounce_stats();
+            println!("bounce: streamed={} serviced={} ({}s)", st, sv, t_ms / 1000);
+            if let Some(t) = touch.as_deref_mut() {
+                t.debug_print();
+            }
+        }
+        let want_flip = (cal_start.elapsed().as_secs() / 3) as u32;
+        if want_flip != flip {
+            flip = want_flip;
+            let inverted = flip % 2 == 1;
+            let (bg, fg) = if inverted { (gfx::BLACK, gfx::WHITE) } else { (gfx::WHITE, gfx::BLACK) };
+            // Full-screen redraws are sliced and paced: one 768 KB burst
+            // (writes + clean) starves the LCD DMA and the image slips by
+            // a random offset. 60-line slices with a short pause between
+            // keep the FIFO fed.
+            // 8-line slices (3.2 KB) with 1 ms gaps: widget-sized updates
+            // never glitch the panel; this keeps every burst as small.
+            for ys in (0..480usize).step_by(8) {
+                {
+                    let mut c = display.canvas();
+                    c.rect(0, ys, 800, 8, bg);
+                }
+                display.flush_rects(&[crate::gfx::Rect::new(0, ys, 800, 8)]);
+                Timer::after(Duration::from_millis(1)).await;
+            }
+            {
+                let mut c = display.canvas();
+                c.circle(400, 240, 10, fg);
+                c.rect(398, 200, 4, 80, fg);
+                c.rect(360, 238, 80, 4, fg);
+                let mut n: heapless::String<4> = heapless::String::new();
+                let _ = core::write!(n, "{}", flip % 10);
+                c.text(392, 120, &n, fg, 3);
+                c.text(280, 40, "touch the crosshair", fg, 1);
+            }
+            display.flush_rects(&[
+                crate::gfx::Rect::new(360, 100, 100, 200),
+                crate::gfx::Rect::new(260, 30, 240, 30),
+            ]);
+        }
+        if let Some(t) = touch.as_deref_mut() {
+            if let Some(p) = t.poll() {
+                let same = stable.is_some_and(|(sx, sy)| {
+                    (sx as i32 - p.x as i32).abs() <= 4 && (sy as i32 - p.y as i32).abs() <= 4
+                });
+                if same {
+                    stable_count += 1;
+                } else {
+                    stable = Some((p.x, p.y));
+                    stable_count = 0;
+                }
+                if stable_count > 20 {
+                    let (tx, ty) = stable.unwrap();
+                    // The crosshair is drawn at FB (400, 240) but appears
+                    // at ((400+Sx)%800, (240+Sy)%480); the touch reports
+                    // the visible (panel) position.
+                    // The panel shows framebuffer index f at glass
+                    // position f + S, so rendering must rotate by -S.
+                    let sx = ((400 - tx as i32).rem_euclid(800)) as usize;
+                    let sy = ((240 - ty as i32).rem_euclid(480)) as usize;
+                    CAL_OFFSET_X.store(sx, Ordering::Relaxed);
+                    CAL_OFFSET_Y.store(sy, Ordering::Relaxed);
+                    println!("LCD cal: touch ({},{}) -> offsets x={} y={}", tx, ty, sx, sy);
+                    return;
+                }
+            } else {
+                stable_count = 0;
+            }
+        }
+        Timer::after(Duration::from_millis(20)).await;
+    }
+    println!("LCD cal: timeout, offsets stay 0");
+    let _ = st;
+}
+
+/// Map a panel-space touch report into framebuffer space using the
+/// calibration offsets.
+fn touch_to_fb(x: u16, y: u16) -> (u16, u16) {
+    let sx = CAL_OFFSET_X.load(Ordering::Relaxed) as i32;
+    let sy = CAL_OFFSET_Y.load(Ordering::Relaxed) as i32;
+    (
+        ((x as i32 - sx).rem_euclid(800)) as u16,
+        ((y as i32 - sy).rem_euclid(480)) as u16,
+    )
 }
 
 /// Allocate the 768000-byte, 64-byte-aligned framebuffer (lands in the

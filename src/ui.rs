@@ -223,6 +223,11 @@ fn draw_cursor(c: &mut Canvas, cur: Option<(u16, u16)>, mut dirty: Option<&mut D
     if cur == last {
         return;
     }
+    // The cursor is given in panel space: draw it without the calibration
+    // rotation so it lands directly under the finger.
+    let (ox, oy) = (c.offset_x, c.offset_y);
+    c.offset_x = 0;
+    c.offset_y = 0;
     if let Some((x, y)) = last {
         c.xor_ring(x as usize, y as usize, 9);
         if let Some(d) = dirty.as_deref_mut() {
@@ -248,6 +253,8 @@ fn draw_cursor(c: &mut Canvas, cur: Option<(u16, u16)>, mut dirty: Option<&mut D
             .ok();
         }
     }
+    c.offset_x = ox;
+    c.offset_y = oy;
     LAST_CURSOR.store(pack_cursor(cur), Ordering::Relaxed);
 }
 

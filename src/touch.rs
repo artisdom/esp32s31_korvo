@@ -51,6 +51,23 @@ impl Touch {
         None
     }
 
+    /// Raw-register telemetry for bring-up (printed by the main loop).
+    pub fn debug_print(&mut self) {
+        let mut buf = [0u8; 12];
+        let ok = read_regs(self.i2c, self.addr, REG_POINT, &mut buf).is_ok();
+        let count = (buf[0] & 0x0f) as usize;
+        let sum10: u8 = buf[..10].iter().fold(0u8, |a, x| a.wrapping_add(*x));
+        let sum11: u8 = buf[..11].iter().fold(0u8, |a, x| a.wrapping_add(*x));
+        esp_println::println!(
+            "tdbg ok={} b={:02x?} cnt={} s10={:02x} s11={:02x}",
+            ok,
+            &buf,
+            count,
+            sum10,
+            sum11
+        );
+    }
+
     /// Poll the current touch point (single-touch is all the demo needs).
     pub fn poll(&mut self) -> Option<TouchPoint> {
         let mut status = [0u8];
@@ -65,9 +82,12 @@ impl Touch {
             return None;
         }
 
-        // status byte + per-point record + checksum byte
-        let len = 1 + count as usize * 7 + 1;
-        let mut buf = [0u8; 1 + 5 * 7 + 1];
+        // Record layout (verified on hardware): status(1) + 8 bytes per
+        // point (track, x LE16, y LE16, strength LE16, pad) + checksum(1)
+        // + pad(1); the checksum covers the whole 1+8n+2 block, i.e. the
+        // block sums to zero. Coordinates are LITTLE-endian.
+        let len = 1 + count as usize * 8 + 2;
+        let mut buf = [0u8; 1 + 5 * 8 + 2];
         if read_regs(self.i2c, self.addr, REG_POINT, &mut buf[..len]).is_err() {
             self.last = None;
             return None;
@@ -79,9 +99,9 @@ impl Touch {
             return self.last;
         }
 
-        let x = u16::from_be_bytes([buf[2], buf[3]]);
-        let y = u16::from_be_bytes([buf[4], buf[5]]);
-        let strength = u16::from_be_bytes([buf[6], buf[7]]);
+        let x = u16::from_le_bytes([buf[2], buf[3]]);
+        let y = u16::from_le_bytes([buf[4], buf[5]]);
+        let strength = u16::from_le_bytes([buf[6], buf[7]]);
         // Clamp to the panel (the controller is configured for 800x480).
         let point = TouchPoint {
             x: x.min(crate::board::LCD_H_RES as u16 - 1),

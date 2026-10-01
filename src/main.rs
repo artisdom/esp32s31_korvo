@@ -67,9 +67,9 @@ fn step(msg: &str) {
 
 #[embassy_executor::task]
 async fn bounce_task() {
+    // No-op with the full-frame ring; kept for future architectures.
     loop {
-        display::service_bounce();
-        embassy_time::Timer::after(embassy_time::Duration::from_micros(200)).await;
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
     }
 }
 
@@ -81,7 +81,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     println!("chip: {}", esp_hal::chip!());
 
     // --- heaps: internal DRAM + PSRAM regions --------------------------------
-    esp_alloc::heap_allocator!(size: 12 * 1024);
+    esp_alloc::heap_allocator!(size: 48 * 1024);
     let psram = esp_hal::psram::Psram::new(peripherals.PSRAM, esp_hal::psram::PsramConfig::default());
     let (_psram_start, psram_size) = psram.raw_parts();
     unsafe {
@@ -453,10 +453,20 @@ async fn lcd_calibrate(
     st: &ui::AppStatus,
     _self_restart: &mut core::sync::atomic::AtomicBool,
 ) {
-    // Animated screen: the panel is suspected of showing a stale early
-    // frame, so the calibration screen flips black/white with a counter
-    // every 3 s. Whatever the user reports seeing settles it.
-    let mut flip: u32 = 0;
+    // Static screen: one draw + one flush. No animation - every cache
+    // clean burst briefly disturbs the LCD DMA stream and shifts the
+    // panel phase horizontally. The crosshair just needs to be visible
+    // and touchable.
+    {
+        let mut c = display.canvas();
+        c.fill(gfx::WHITE);
+        c.circle(400, 240, 10, gfx::BLACK);
+        c.rect(398, 200, 4, 80, gfx::BLACK);
+        c.rect(360, 238, 80, 4, gfx::BLACK);
+        c.text(280, 40, "touch the crosshair", gfx::BLACK, 1);
+        c.text(248, 60, "to calibrate the display", gfx::BLACK, 1);
+    }
+    display.flush();
     step("LCD cal: touch the visible crosshair (5 min timeout)");
 
     let cal_start = esp_hal::time::Instant::now();
@@ -470,43 +480,13 @@ async fn lcd_calibrate(
             last_dbg = t_ms / 1000;
             let (st, sv) = display::bounce_stats();
             println!("bounce: streamed={} serviced={} ({}s)", st, sv, t_ms / 1000);
+            if t_ms / 1000 == 2 {
+                let trace = display::eof_desc_trace();
+                println!("eof_desc[0..32]={:?}", &trace);
+            }
             if let Some(t) = touch.as_deref_mut() {
                 t.debug_print();
             }
-        }
-        let want_flip = (cal_start.elapsed().as_secs() / 3) as u32;
-        if want_flip != flip {
-            flip = want_flip;
-            let inverted = flip % 2 == 1;
-            let (bg, fg) = if inverted { (gfx::BLACK, gfx::WHITE) } else { (gfx::WHITE, gfx::BLACK) };
-            // Full-screen redraws are sliced and paced: one 768 KB burst
-            // (writes + clean) starves the LCD DMA and the image slips by
-            // a random offset. 60-line slices with a short pause between
-            // keep the FIFO fed.
-            // 8-line slices (3.2 KB) with 1 ms gaps: widget-sized updates
-            // never glitch the panel; this keeps every burst as small.
-            for ys in (0..480usize).step_by(8) {
-                {
-                    let mut c = display.canvas();
-                    c.rect(0, ys, 800, 8, bg);
-                }
-                display.flush_rects(&[crate::gfx::Rect::new(0, ys, 800, 8)]);
-                Timer::after(Duration::from_millis(1)).await;
-            }
-            {
-                let mut c = display.canvas();
-                c.circle(400, 240, 10, fg);
-                c.rect(398, 200, 4, 80, fg);
-                c.rect(360, 238, 80, 4, fg);
-                let mut n: heapless::String<4> = heapless::String::new();
-                let _ = core::write!(n, "{}", flip % 10);
-                c.text(392, 120, &n, fg, 3);
-                c.text(280, 40, "touch the crosshair", fg, 1);
-            }
-            display.flush_rects(&[
-                crate::gfx::Rect::new(360, 100, 100, 200),
-                crate::gfx::Rect::new(260, 30, 240, 30),
-            ]);
         }
         if let Some(t) = touch.as_deref_mut() {
             if let Some(p) = t.poll() {

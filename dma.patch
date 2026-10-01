@@ -1,0 +1,74 @@
+diff --git a/src/display.rs b/src/display.rs
+index fc64dbb..3444a01 100644
+--- a/src/display.rs
++++ b/src/display.rs
+@@ -102,21 +102,51 @@ pub fn bounce_stats() -> (usize, usize) {
+         SERVICED.load(AtOrdering::Relaxed),
+     )
+ }
++
++pub fn desc_base() -> usize {
++    (&raw const DESCRIPTORS).addr()
++}
++
++/// Descriptor indices of the first EOFs (diagnostics).
++pub fn eof_desc_trace() -> [usize; 32] {
++    let mut out = [usize::MAX; 32];
++    for i in 0..32 {
++        out[i] = EOF_DESC[i].load(AtOrdering::Relaxed);
++    }
++    out
++}
+ /// Refill task: number of segment completions already handled.
+ static SERVICED: AtomicUsize = AtomicUsize::new(0);
+ 
+ extern "C" fn lcd_dma_eof_isr() {
+     // Clear the Eof flag for the LCD's AXI GDMA channel (DMA_AXI_CH0) and
+-    // count the finished segment. The 1W write-clear register makes this a
+-    // single store; safe from an ISR.
++    // count the finished segment. Also snapshot the hardware's EOF
++    // descriptor address (mask to the descriptor array offset) so the
++    // actual walk pattern can be diagnosed.
++    let dscr = esp_hal::peripherals::AXI_GDMA::regs()
++        .out_ch(0)
++        .out_eof_des_addr()
++        .read()
++        .out_eof_des_addr()
++        .bits() as usize;
+     esp_hal::peripherals::AXI_GDMA::regs()
+         .out_ch(0)
+         .out_int()
+         .clr()
+         .write(|w| w.out_eof().clear_bit_by_one());
+-    STREAMED.fetch_add(1, AtOrdering::Relaxed);
++    let idx = STREAMED.fetch_add(1, AtOrdering::Relaxed);
++    if idx < 64 {
++        EOF_DESC[idx].store(dscr, AtOrdering::Relaxed);
++    }
+ }
+ 
++/// Last 64 EOF descriptor indices (diagnostics).
++static EOF_DESC: [AtomicUsize; 64] = {
++    #[allow(clippy::declare_interior_mutable_const)]
++    const Z: AtomicUsize = AtomicUsize::new(usize::MAX);
++    [Z; 64]
++};
++
+ const LCD_EOF_HANDLER: esp_hal::interrupt::InterruptHandler =
+     esp_hal::interrupt::InterruptHandler::new(
+         lcd_dma_eof_isr,
+diff --git a/src/main.rs b/src/main.rs
+index 3deeec4..c2fb1b7 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -470,6 +470,10 @@ async fn lcd_calibrate(
+             last_dbg = t_ms / 1000;
+             let (st, sv) = display::bounce_stats();
+             println!("bounce: streamed={} serviced={} ({}s)", st, sv, t_ms / 1000);
++            if t_ms / 1000 == 2 {
++                let trace = display::eof_desc_trace();
++                println!("eof_desc[0..32]={:?}", &trace);
++            }
+             if let Some(t) = touch.as_deref_mut() {
+                 t.debug_print();
+             }

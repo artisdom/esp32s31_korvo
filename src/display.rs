@@ -13,7 +13,7 @@ use esp_hal::{
     dma::{DmaDescriptor, DmaTxBuffer, Preparation, aligned::DmaAlignedMut},
     gpio::Level,
     lcd_cam::{
-        LcdCam,
+
         lcd::{
             ClockMode,
             DelayMode,
@@ -45,7 +45,7 @@ pub struct Display;
 
 impl Display {
     pub fn new(
-        lcd_cam: LcdCam<'static, esp_hal::Blocking>,
+        lcd: esp_hal::lcd_cam::lcd::Lcd<'static, esp_hal::Blocking>,
         channel: impl esp_hal::lcd_cam::LcdDmaTxChannel<'static>,
         fb: &'static mut [u8],
         pins: LcdPins,
@@ -93,8 +93,7 @@ impl Display {
             .with_vsync_mode(DelayMode::None)
             .with_output_bit_mode(DelayMode::None);
 
-        let mut dpi = Dpi::new(lcd_cam.lcd, channel, config)
-            .map_err(|_| "DPI config rejected")?;
+        let mut dpi = Dpi::new(lcd, channel, config).map_err(|_| "DPI config rejected")?;
 
         let mut dpi = dpi
             .with_vsync(pins.vsync)
@@ -185,8 +184,22 @@ impl Display {
 }
 
 pub fn bounce_stats() -> (usize, usize) { (0, 0) }
-pub fn eof_desc_trace() -> [usize; 32] { [usize::MAX; 32] }
 pub fn desc_base() -> usize { 0 }
+
+/// Frames completed since boot (EOF on descriptor 0), and the timestamp of
+/// the previous read, so callers can derive the refresh rate.
+static FRAMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Frame counter and the number of PCLKs per frame (active + blanking).
+pub fn frame_count() -> usize {
+    FRAMES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn pixels_per_frame() -> u32 {
+    ((b::LCD_H_RES + b::LCD_HSYNC_BACK_PORCH + b::LCD_HSYNC_FRONT_PORCH + b::LCD_HSYNC_PULSE_WIDTH)
+        * (b::LCD_V_RES + b::LCD_VSYNC_BACK_PORCH + b::LCD_VSYNC_FRONT_PORCH + b::LCD_VSYNC_PULSE_WIDTH))
+        as u32
+}
 
 extern "C" fn lcd_dma_eof_isr() {
     // Clear the EOF flag (W1C).
@@ -195,6 +208,7 @@ extern "C" fn lcd_dma_eof_isr() {
         .out_int()
         .clr()
         .write(|w| w.out_eof().clear_bit_by_one());
+    FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 const LCD_EOF_HANDLER: esp_hal::interrupt::InterruptHandler =
@@ -248,7 +262,9 @@ impl FrameRing {
             let d = &mut desc[idx];
             d.set_size(chunk);
             d.set_length(chunk);
-            d.set_suc_eof(false);
+            // Only the first descriptor raises EOF, so the interrupt marks
+            // the start of every frame and `FRAMES` counts frames.
+            d.set_suc_eof(idx == 0);
             d.set_owner(esp_hal::dma::Owner::Dma);
             d.buffer = unsafe { fb.as_mut_ptr().add(offset) };
             d.next = unsafe { ring_base.add(idx + 1) };

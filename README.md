@@ -16,15 +16,15 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 
 | Feature | Hardware | Driver | Status on this board |
 |---|---|---|---|
-| RGB LCD 800x480@60Hz | 16-bit bus, 26 MHz PCLK, framebuffer in PSRAM | `esp_hal::lcd_cam::lcd::dpi` + custom descriptor-ring DMA buffer | **works** — continuous scan-out from PSRAM, ~18 fps full-frame redraws |
+| RGB LCD 800x480 | 16-bit bus, 18 MHz PCLK (35 Hz), framebuffer in PSRAM | `esp_hal::lcd_cam::lcd::dpi` + custom descriptor-ring DMA buffer | **works** — continuous scan-out from PSRAM at the panel's designed 35 Hz |
 | Capacitive touch | GT1151 @ I2C 0x14 | this repo (`touch.rs`, 16-bit regs, checksummed reports) | **works** — polled, drives page navigation + cursor |
 | Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | **works** — on-chip synthesized chime/test tone, 48 kHz/16-bit |
 | Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | `esp_hal::i2s` DMA + RMS meter | **partial** — DMA delivers samples; full-duplex clocking of the slave codec is not phase-locked in esp-hal yet, so sample quality is not guaranteed |
 | microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + hand-rolled read-only FAT inspector | **works** (verified with a 128 GB card) — card info, partition/FAT type, volume label, root dir listing, first `.TXT` preview. Never writes. |
 | WS2812 status LED | GPIO37 | `esp_hal::rmt` | **works** — colour-cycle breathing, orange flash on key press |
-| Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0) | `esp_hal::analog::adc` | **blocked upstream** — see "ADC status" below |
+| Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET, idle 2000 mV |
 | USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
-| DVP camera | OV3660 / SC101IOT (SCCB on shared I2C) | probe only (`camera.rs`) | **detected?** — see "Camera status" below |
+| DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: 20 MHz XCLK from LCD_CAM + paged SCCB | **detected** — PID 0xda4a; capture is future work |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
 | Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: USB task |
 | Wi-Fi 6 / BT 5.4 / 802.15.4 | modem | `esp-radio` | **not in this demo** — esp-radio support for the S31 is unreleased/experimental upstream |
@@ -43,39 +43,44 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 - **VOL+ / VOL-** change the ES8389 DAC volume in 3 dB steps.
   (Buttons require the ADC - see below.)
 
-## ADC status (buttons) — upstream gap
+## Buttons: why raw 0 means "idle"
 
-`esp_hal`'s S31 ADC driver (as of esp-hal `main` @ `0e9fe8d`) programs the same
-APB_SARADC registers ESP-IDF does, conversions "complete", but the data
-register always reads **0**. The upstream HIL test only asserts
-`value <= MAX_RAW`, so a constant 0 passes CI.
+The four keys are a resistor ladder on **GPIO42 = `ADC1_CH0_N`** — the
+*negative* input of the differential SAR channel. The ladder idles at 2 V,
+which is the **bottom** of the code range, so an untouched board legitimately
+reads raw `0`. Pressing a key lowers the ladder voltage and *raises* the code.
 
-What was tried locally (branch `s31-adc-clock-patch` in the esp-hal checkout):
+The SAR's 17 comparator bits have non-uniform weights, so the code is a
+weighted sum, not the integer value. `buttons.rs` ports both the weight table
+and the code→voltage mapping from the vendor BSP's
+`esp32_s31_adc_calibration.c`, giving 2000 mV at idle and 380/820/1340/1870 mV
+for VOL+/VOL-/MODE/SET — the same thresholds the stock firmware uses.
 
-1. `LP_PERI_CLKRST.adc_ctrl.lp_adc_clk_en = 1` + `lp_adc_rst_en` reset pulse
-   (= IDF `adc_ll_enable_bus_clock` / `adc_ll_reset_register`),
-2. `sar1_clk_pos_sel = 1` (IDF sets it in `adc_ll_digi_set_convert_mode`),
-3. regi2c writes to the SAR blocks (0x10/0x11) per the Korvo BSP's
-   `esp32_s31_adc_calibration.c` (CAL_DONE / raw-output enable).
+This was verified against ESP-IDF itself: an IDF `adc_oneshot` app built from
+the local checkout reads raw 0 on the same channel, so the hardware and the
+esp-hal driver were both correct — only the interpretation was wrong.
 
-None made data flow. Prime remaining suspect: analog-domain init performed by
-the ESP-IDF bootloader/startup path that neither `esp-bootloader-esp-idf` nor
-esp-hal replicate (the vendor BSP ships its own runtime SAR weight calibration
-for exactly this reason). The IDF S31 SOC caps have no
-`SOC_ADC_CALIBRATION_V1_SUPPORTED`, so IDF's own adc_common.c calibration
-constructor is compiled out there too.
-
-Until this is fixed upstream (or in the local patch), the four onboard buttons
-read 0 mV and the UI degrades gracefully.
+Local esp-hal patch (`s31-adc-clock-patch` branch): the driver now also
+enables the SAR's raw-data output and `cal_done` through regi2c (blocks 0x10 /
+0x11), exactly as the vendor BSP does before using the ADC.
 
 ## Camera status
 
-The stock firmware supports OV3660 and SC101IOT sensors behind the DVP port.
-This demo probes both SCCB addresses with the sensor ID registers; on this
-board neither acknowledged (sensors likely need their power/XCLK bring-up
-sequence before SCCB answers). Full DVP capture additionally needs a Rust
-port of the vendor sensor init tables (~2k lines of registers) — tracked as
-future work; the esp-hal `lcd_cam::cam` DVP driver itself is available.
+The onboard camera answers SCCB once the SoC drives its master clock:
+
+1. **20 MHz XCLK on GPIO55** from the DVP controller's own clock generator
+   (160 MHz PLL / 8) — *not* LEDC/PWM. The vendor BSP derives it the same way
+   (`esp_cam_ctlr_dvp_output_clock`).
+2. ~100 ms for the clock to settle (the vendor waits 20 ms for OV3660, 100 ms
+   for SC101IOT).
+3. **Paged SCCB**: the SC101IOT does not take 16-bit register addresses. The
+   high byte goes into register `0xf0` and every access uses the 8-bit low
+   byte (`sc101iot_read_a16v8` in the vendor driver).
+
+With that in place the board reports **SC101IOT, PID 0xda4a** (OV3660 is not
+populated on this unit). Live capture still needs a port of the vendor's
+~190-entry init table plus DVP DMA reception and YUV→RGB565 conversion; the
+esp-hal `lcd_cam::cam` DVP driver is available for it.
 
 ## Layout
 

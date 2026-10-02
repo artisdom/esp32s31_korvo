@@ -90,9 +90,23 @@ pub const CAM_XCLK: u8 = 55;
 pub const CAM_VSYNC: u8 = 56;
 pub const CAM_HSYNC: u8 = 57;
 
+/// How a sensor's registers are addressed over SCCB.
+///
+/// OV3660 takes a plain 16-bit register address. The SC101IOT uses
+/// "I2C paging mode": the high byte of the address goes into register 0xf0
+/// and every access then uses the 8-bit low byte (see `sc101iot_read_a16v8`
+/// in the vendor sensor driver).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Sccb {
+    /// 16-bit register address, sent big-endian.
+    Addr16,
+    /// Page register 0xf0 + 8-bit register address.
+    Paged,
+}
+
 /// Candidate sensors supported by the stock firmware: (name, SCCB addr,
-/// ID register, expected ID). ID registers are 16-bit addressed.
-pub const CAM_SENSORS: [(&str, u8, u16, u16); 2] = [
-    ("OV3660", 0x3c, 0x300a, 0x3660),
-    ("SC101IOT", 0x68, 0x31f7, 0xda4a),
+/// ID register, expected ID, addressing mode). Addresses are 7-bit.
+pub const CAM_SENSORS: [(&str, u8, u16, u16, Sccb); 2] = [
+    ("OV3660", 0x3c, 0x300a, 0x3660, Sccb::Addr16),
+    ("SC101IOT", 0x68, 0x31f7, 0xda4a, Sccb::Paged),
 ];

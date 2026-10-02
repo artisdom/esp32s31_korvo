@@ -21,7 +21,7 @@ Reset via serial: DTR=low (run mode), pulse RTS high→low (EN toggle).
 | **0x10** | ES8389 audio codec | Vendor macro says 0x20 — that's the 8-bit write form. Wire ACKs at 0x10 7-bit. |
 | **0x14** | GT1151 touch controller | Alternate 0x5D also valid. Product ID at this unit: "1158". |
 | 0x3C | OV3660 camera (if present) | SCCB — did not answer without power/XCLK bring-up |
-| 0x68 | SC101IOT camera (if present) | Same |
+| **0x68** | **SC101IOT camera** | Answers once the 20 MHz XCLK runs; PID 0xda4a. Paged SCCB (reg 0xf0 = page) |
 
 ## Pin map (from vendor BSP, verified against schematic)
 
@@ -47,16 +47,23 @@ DATA = GPIO37    (RMT-driven)
 
 ### ADC button ladder
 ```
-GPIO42 = ADC1_CH0 (differential SAR ADC)
+GPIO42 = ADC1_CH0_N — the NEGATIVE input of the differential SAR channel
+
+Because the ladder sits on the negative input, the code is inverted: the
+2 V idle level is the BOTTOM of the code range and reads raw 0. Pressing a
+key lowers the ladder voltage and RAISES the code.
 
 Voltage ladder (0 dB attenuation, 2 V full-scale):
-  idle (no press) = 2000 mV
+  idle (no press) = 2000 mV   → raw 0
   VOL+            =  380 mV
   VOL-            =  820 mV
   MODE            = 1340 mV
   SET             = 1870 mV
 
-⚠ Upstream esp-hal bug: S31 ADC always reads 0 — see 10-lcd-known-issues.md
+The SAR's 17 bits are non-uniformly weighted, so the code is the weighted sum
+of the set bits (weights sum to 4393), and
+    mv = 2000 - 4000 * code / 4393
+Both come from the vendor BSP's esp32_s31_adc_calibration.c.
 ```
 
 ### microSD (SDMMC 4-bit)
@@ -111,7 +118,7 @@ timing (HSYNC/VSYNC/DE/PCLK) with a **random phase each boot**.
 
 Correct timing (from Espressif's `SUB_BOARD3_800_480_PANEL_35HZ_RGB_TIMING`):
 ```
-PCLK       = 18 MHz (see PCLK 2× bug in 10-lcd-known-issues.md)
+PCLK       = 18 MHz  → ~35 Hz refresh (verified on hardware)
 HSYNC      = 40 PCLK pulse, 40 back porch, 48 front porch
 VSYNC      = 23 lines pulse, 32 back porch, 13 front porch
 Data latch = falling PCLK edge (pclk_active_neg = true)

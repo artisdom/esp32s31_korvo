@@ -122,14 +122,23 @@ async fn main(spawner: embassy_executor::Spawner) {
         d15: peripherals.GPIO36,
     };
     let lcd_cam = esp_hal::lcd_cam::LcdCam::new(peripherals.LCD_CAM);
-    let mut display =
-        match display::Display::new(lcd_cam, peripherals.DMA_AXI_CH0, fb, lcd_pins) {
-            Ok(d) => {
-                step("LCD scanning");
-                d
-            }
-            Err(e) => panic!("display init failed: {}", e),
-        };
+    // The camera's master clock comes out of the same peripheral. Start it
+    // before anything talks to the sensor: without XCLK the SCCB probe is
+    // silent (see camera.rs).
+    let camera = camera::start_xclk(lcd_cam.cam);
+    step(if camera.is_ok() {
+        "camera XCLK 20 MHz on GPIO55"
+    } else {
+        "camera XCLK failed"
+    });
+    let mut display = match display::Display::new(lcd_cam.lcd, peripherals.DMA_AXI_CH0, fb, lcd_pins)
+    {
+        Ok(d) => {
+            step("LCD scanning");
+            d
+        }
+        Err(e) => panic!("display init failed: {}", e),
+    };
 
     // Bounce-ring refill task: must run far faster than one ring cycle
     // (~2.7 ms); writing a segment mid-stream corrupts the picture.
@@ -238,10 +247,18 @@ async fn main(spawner: embassy_executor::Spawner) {
     }
 
     // --- camera probe ----------------------------------------------------------------------
-    let cam_probe = camera::probe(i2c);
+    // The sensor needs its master clock to settle before it answers SCCB
+    // (20 ms for OV3660, 100 ms for SC101IOT - the vendor BSP waits 100 ms).
+    Timer::after(Duration::from_millis(120)).await;
+    let mut cam_probe = camera::probe(i2c);
+    cam_probe.xclk = camera.is_ok();
     match cam_probe.sensor {
         Some((name, pid)) => println!("camera: {} PID=0x{:04x}", name, pid),
-        None => println!("camera: no sensor answered on SCCB"),
+        None => println!(
+            "camera: no sensor answered on SCCB ({} acked, XCLK {})",
+            cam_probe.acked,
+            if cam_probe.xclk { "on" } else { "off" }
+        ),
     }
 
     // --- microSD -----------------------------------------------------------------------------
@@ -307,7 +324,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         flash_led: false,
     };
 
-    lcd_calibrate(&mut display, touch.as_mut(), &st, &mut core::sync::atomic::AtomicBool::new(false)).await;
+    lcd_calibrate(&mut display, touch.as_mut(), &mut buttons).await;
 
     let start = Instant::now();
     let mut touch_seen = 0u32;
@@ -450,8 +467,7 @@ async fn main(spawner: embassy_executor::Spawner) {
 async fn lcd_calibrate(
     display: &mut display::Display,
     mut touch: Option<&mut touch::Touch>,
-    st: &ui::AppStatus,
-    _self_restart: &mut core::sync::atomic::AtomicBool,
+    buttons: &mut buttons::Buttons,
 ) {
     // Static screen: one draw + one flush. No animation - every cache
     // clean burst briefly disturbs the LCD DMA stream and shifts the
@@ -467,23 +483,39 @@ async fn lcd_calibrate(
         c.text(248, 60, "to calibrate the display", gfx::BLACK, 1);
     }
     display.flush();
-    step("LCD cal: touch the visible crosshair (5 min timeout)");
+    step("LCD cal: touch the visible crosshair (30 s, or press a button)");
 
     let cal_start = esp_hal::time::Instant::now();
     let mut stable: Option<(u16, u16)> = None;
     let mut stable_count = 0u32;
     let mut last_dbg = 0u64;
+    let mut last_frames = display::frame_count();
 
-    while cal_start.elapsed().as_secs() < 300 {
+    while cal_start.elapsed().as_secs() < 30 {
+        // Buttons stay live: any key press skips the calibration.
+        if let Some(btn) = buttons.poll() {
+            println!(
+                "LCD cal: {} pressed (raw={}, {} mV) -> skipping",
+                btn.label(),
+                buttons.last_raw,
+                buttons.last_mv
+            );
+            return;
+        }
         let t_ms = cal_start.elapsed().as_millis() as u64;
         if t_ms / 1000 != last_dbg {
             last_dbg = t_ms / 1000;
-            let (st, sv) = display::bounce_stats();
-            println!("bounce: streamed={} serviced={} ({}s)", st, sv, t_ms / 1000);
-            if t_ms / 1000 == 2 {
-                let trace = display::eof_desc_trace();
-                println!("eof_desc[0..32]={:?}", &trace);
-            }
+            // frames in the last second -> pixel clock = fps * PCLKs/frame
+            let frames = display::frame_count() - last_frames;
+            last_frames = display::frame_count();
+            println!(
+                "cal: {} s, fps={} (PCLK ~{} MHz), button raw={} ({} mV)",
+                t_ms / 1000,
+                frames,
+                frames as u32 * display::pixels_per_frame() / 1_000_000,
+                buttons.last_raw,
+                buttons.last_mv
+            );
             if let Some(t) = touch.as_deref_mut() {
                 t.debug_print();
             }
@@ -520,7 +552,6 @@ async fn lcd_calibrate(
         Timer::after(Duration::from_millis(20)).await;
     }
     println!("LCD cal: timeout, offsets stay 0");
-    let _ = st;
 }
 
 /// Map a panel-space touch report into framebuffer space using the

@@ -26,14 +26,14 @@ implementation, porting to other boards, or contributing fixes upstream.
 
 | Feature | Hardware | Status in this demo |
 |---|---|---|
-| RGB LCD 800×480 | ST7262E43, 16-bit bus, 4.3″ | Working (static pages, touch cal, known slow drift) |
+| RGB LCD 800×480 | ST7262E43, 16-bit bus, 4.3″ | Working — 18 MHz PCLK / 35 Hz, touch calibration (see 10 for the fixed PCLK 2× bug) |
 | Capacitive touch | GT1151 @ I2C 0x14 | Working |
 | Audio playback | ES8389 codec + 2× NS4150B 3 W PAs | Working (48 kHz synthesized tones) |
 | Mic capture | 2× analog → ES8389 ADC → I2S RX | Working (RMS meter) |
 | microSD | SDMMC 4-bit @ 20 MHz | Working (128 GB card verified) |
 | WS2812 LED | GPIO37, RMT-driven | Working |
-| Buttons | 4-key ADC ladder on GPIO42 | Blocked (upstream ADC bug) |
+| Buttons | 4-key ADC ladder on GPIO42 (ADC1_CH0_N) | Working — see 13-buttons-camera.md for the inverted-code gotcha |
 | USB 2.0 HS | Type-A port, native USB_HS | Working (CDC-ACM on core 1) |
-| DVP camera | OV3660/SC101IOT on SCCB | Probe only |
+| DVP camera | SC101IOT on SCCB | Detected (PID 0xda4a) — needs XCLK + paged SCCB, see 13 |
 | PSRAM | 16 MB hex @ 250 MHz | Working (heap + framebuffer) |
 | Wi-Fi/BT/802.15.4 | modem | Not attempted (upstream esp-radio) |

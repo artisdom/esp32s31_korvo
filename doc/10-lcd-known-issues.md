@@ -1,6 +1,22 @@
 # LCD: Known Issues & Root Causes
 
-## Issue 1: PCLK 2× bug
+## Issue 1: PCLK 2× bug — **RESOLVED**
+
+**Resolution (2026-10-02)**: the pixel clock is `lcd_clk / mo`, and ESP-IDF
+never uses `mo = 1` — `esp_hal_lcd/lcd_hal.c` starts with `mo = 2` "due to
+some unstable hardware issue" and targets twice the pixel clock for the module
+clock. With `equ_sysclk = 1` (esp-hal's old S31 path) the panel was driven at
+double speed. The local esp-hal patch now requests `2 × pclk` from the clock
+tree and sets `equ_sysclk = 0, clkcnt_n = 1`, i.e. `mo = 2`.
+
+Measured on hardware: 18 MHz PCLK / ~35 Hz refresh (was ~36 MHz / ~71 Hz),
+matching `SUB_BOARD3_800_480_PANEL_35HZ_RGB_TIMING`. `display::frame_count()`
++ `display::pixels_per_frame()` give the refresh rate and derived PCLK on the
+console, so this can be re-checked after any clock change.
+
+---
+
+### Issue 1 (original report, kept for reference)
 
 **Symptom**: Requesting 18 MHz PCLK produces 36 MHz actual (measured via
 DMA descriptor rate and refresh-rate calculation). Frame rate is ~71 Hz

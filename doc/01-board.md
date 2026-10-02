@@ -3,7 +3,9 @@
 ## Module
 
 ESP32-S31-WROOM-3: dual-core RISC-V @ 320 MHz, 16 MB SPI flash, 16 MB hex
-PSRAM @ 250 MHz. Wi-Fi 6 / BT 5.4 / 802.15.4 (radio not used in this demo).
+PSRAM @ 250 MHz. Wi-Fi 6 / Bluetooth 5.4 LE and Classic / 802.15.4.
+Optional Rust radio demonstrations and current host-stack limits are documented
+in [radio support](16-radio-support.md).
 
 ## Serial console
 

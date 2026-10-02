@@ -37,4 +37,4 @@ implementation, porting to other boards, or contributing fixes upstream.
 | USB 2.0 HS | Type-A port, native USB_HS | Working (CDC-ACM on core 1) |
 | DVP camera | SC101IOT on SCCB | Detected (PID 0xda4a) — needs XCLK + paged SCCB, see 13 |
 | PSRAM | 16 MB hex @ 250 MHz | Working (heap + framebuffer) |
-| Wi-Fi/BT/802.15.4 | modem | Not attempted (upstream esp-radio) |
+| Wi-Fi/BT/802.15.4 | modem | Optional Wi-Fi/BLE and 802.15.4 discovery builds; see [radio support](16-radio-support.md). Classic and Thread host stacks remain unimplemented. |

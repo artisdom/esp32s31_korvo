@@ -46,6 +46,8 @@ mod led;
 mod media;
 mod pcm;
 mod psram_buffer;
+#[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154"))]
+mod radio;
 mod sc101iot_regs;
 mod sdcard;
 mod storage;
@@ -81,7 +83,15 @@ async fn main(_spawner: embassy_executor::Spawner) {
     println!("chip: {}", esp_hal::chip!());
 
     // --- heaps: internal DRAM + PSRAM regions --------------------------------
+    #[cfg(not(feature = "radio-wifi-ble"))]
     esp_alloc::heap_allocator!(size: 48 * 1024);
+    #[cfg(feature = "radio-wifi-ble")]
+    {
+        // Two regions keep large camera buffers in PSRAM: a 150 KiB frame
+        // cannot fit either internal allocation, while radio control blocks can.
+        esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+        esp_alloc::heap_allocator!(size: 48 * 1024);
+    }
     let psram =
         esp_hal::psram::Psram::new(peripherals.PSRAM, esp_hal::psram::PsramConfig::default());
     let (_psram_start, psram_size) = psram.raw_parts();
@@ -98,6 +108,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
     step("rtos ok");
+    #[cfg(feature = "radio-wifi-ble")]
+    _spawner.spawn(radio::wifi_task(peripherals.WIFI).expect("spawn Wi-Fi"));
+    #[cfg(feature = "radio-wifi-ble")]
+    _spawner.spawn(radio::ble_task(peripherals.BT).expect("spawn BLE"));
+    #[cfg(feature = "radio-802154")]
+    _spawner.spawn(radio::ieee_task(peripherals.IEEE802154).expect("spawn 802.15.4"));
+    #[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154"))]
+    Timer::after_millis(100).await;
     // --- RGB LCD + PSRAM framebuffer ---------------------------------------------------
     let fb: &'static mut [u8] = alloc_fb().expect("framebuffer alloc");
     let lcd_pins = display::LcdPins {

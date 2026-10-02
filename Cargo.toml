@@ -9,7 +9,7 @@ publish = false
 embassy-executor = "0.10"
 embassy-futures  = "0.1"
 embassy-sync     = "0.8"
-embassy-time     = "0.4"
+embassy-time     = "0.5"
 embassy-usb      = { version = "0.6", default-features = false }
 
 # esp-rs stack ------------------------------------------------------------
@@ -37,6 +37,18 @@ critical-section = "1.2"
 static_cell = "2"
 heapless    = "0.8"
 libm        = "0.2"
+
+# Radio application tasks are opt-in so existing media firmware stays unchanged.
+esp-radio = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-radio", features = ["esp32s31", "unstable"], optional = true }
+embassy-net = { version = "0.9", default-features = false, features = ["medium-ethernet", "proto-ipv4", "dhcpv4", "tcp"], optional = true }
+trouble-host = { version = "0.7", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool-mtu-255"], optional = true }
+
+ieee802154 = { version = "0.6.1", optional = true }
+
+[features]
+default = []
+radio-wifi-ble = ["dep:esp-radio", "esp-radio/wifi", "esp-radio/ble", "esp-radio/coex", "esp-rtos/esp-radio", "dep:embassy-net", "dep:trouble-host"]
+radio-802154 = ["dep:ieee802154", "dep:esp-radio", "esp-radio/ieee802154", "esp-rtos/esp-radio"]
 
 [profile.release]
 debug            = true

@@ -454,7 +454,31 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
                 1,
             );
         }
-        #[cfg(not(any(feature = "radio-wifi-ble", feature = "radio-802154")))]
+        #[cfg(feature = "radio-zigbee")]
+        {
+            use core::sync::atomic::Ordering;
+            let phase = match crate::radio::status::ZIGBEE.load(Ordering::Relaxed) {
+                1 => "Zigbee: configure PAN/channel",
+                2 => "Zigbee: partition required",
+                3 => "Zigbee commissioning",
+                4 => "Zigbee: initial join complete",
+                5 => "Zigbee stopped / check UART",
+                _ => "Zigbee starting",
+            };
+            c.text(card.x + 12, card.y + 120, phase, gfx::SKY, 1);
+            c.text(
+                card.x + 12,
+                card.y + 138,
+                "Rust Basic / Identify demo",
+                gfx::TEXT,
+                1,
+            );
+        }
+        #[cfg(not(any(
+            feature = "radio-wifi-ble",
+            feature = "radio-802154",
+            feature = "radio-zigbee"
+        )))]
         c.text(
             card.x + 12,
             card.y + 120,

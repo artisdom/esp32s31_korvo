@@ -1,6 +1,8 @@
 //! Zigbee end-device commissioning, secure key exchange, interview and parent
 //! maintenance using zigbee-rs. Persistent state is restricted to an explicitly
 //! reserved partition; no guessed flash address is erased.
+use super::status;
+use core::sync::atomic::Ordering;
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_futures::join::join;
 use embassy_time::{Delay, Timer};
@@ -56,15 +58,18 @@ static STACK: StaticCell<Stack> = StaticCell::new();
 
 #[embassy_executor::task]
 pub async fn zigbee_task(radio: IEEE802154<'static>, flash: FLASH<'static>) {
+    status::ZIGBEE.store(1, Ordering::Relaxed);
     let Some(epid) = option_env!("KORVO_ZIGBEE_EPID") else {
         println!("Zigbee: set KORVO_ZIGBEE_EPID to your coordinator extended PAN in hexadecimal");
         return;
     };
     let Ok(epid) = u64::from_str_radix(epid.trim_start_matches("0x"), 16) else {
+        status::ZIGBEE.store(5, Ordering::Relaxed);
         println!("Zigbee: invalid extended PAN ID");
         return;
     };
     if epid == 0 || epid == u64::MAX {
+        status::ZIGBEE.store(5, Ordering::Relaxed);
         println!("Zigbee: extended PAN must identify a real coordinator");
         return;
     }
@@ -72,6 +77,7 @@ pub async fn zigbee_task(radio: IEEE802154<'static>, flash: FLASH<'static>) {
         .unwrap_or("11")
         .parse::<u8>();
     let Ok(channel @ 11..=26) = channel else {
+        status::ZIGBEE.store(5, Ordering::Relaxed);
         println!("Zigbee: channel must be 11 through 26");
         return;
     };
@@ -81,11 +87,13 @@ pub async fn zigbee_task(radio: IEEE802154<'static>, flash: FLASH<'static>) {
         || flash.read(0x8000, &mut partitions).is_err()
         || !super::partition::zigbee_partition_reserved(&partitions)
     {
+        status::ZIGBEE.store(2, Ordering::Relaxed);
         println!(
             "Zigbee: refusing persistence writes; flash partitions-radio.csv first (16 MiB flash required)"
         );
         return;
     }
+    status::ZIGBEE.store(3, Ordering::Relaxed);
     let storage = zigbee::init_with_flash(BlockingAsync::new(flash), RANGE).await;
     let config = StackConfig::new(
         NetworkConfig {
@@ -145,6 +153,7 @@ pub async fn zigbee_task(radio: IEEE802154<'static>, flash: FLASH<'static>) {
     join(
         async {
             let outcome = stack.run(Delay).await;
+            status::ZIGBEE.store(5, Ordering::Relaxed);
             println!(
                 "Zigbee stack stopped: {:?}; retained state for next reboot",
                 outcome
@@ -152,6 +161,7 @@ pub async fn zigbee_task(radio: IEEE802154<'static>, flash: FLASH<'static>) {
         },
         async {
             stack.wait_until_joined().await;
+            status::ZIGBEE.store(4, Ordering::Relaxed);
             let nib = zigbee::nwk::nib::get_ref();
             println!(
                 "Zigbee joined: address {:04x}, PAN {:04x}, channel {}",

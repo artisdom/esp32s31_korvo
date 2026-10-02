@@ -12,3 +12,6 @@ pub static CHANNEL: AtomicU32 = AtomicU32::new(0);
 pub static RECEIVED: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "radio-802154")]
 pub static ZIGBEE_BEACONS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "radio-zigbee")]
+pub static ZIGBEE: AtomicU32 = AtomicU32::new(0);

@@ -117,10 +117,10 @@ impl Media {
             video_selected: 0,
             last_video: None,
             recorder: None,
-            buffer: vec![0; 16384].into_boxed_slice(),
-            output: vec![0; 32768].into_boxed_slice(),
-            samples: vec![0; nanomp3_core::MAX_SAMPLES_PER_FRAME].into_boxed_slice(),
-            decoder: Box::new(nanomp3_core::Decoder::new()),
+            buffer: crate::psram_buffer::zeroed(16384),
+            output: crate::psram_buffer::zeroed(32768),
+            samples: crate::psram_buffer::samples(nanomp3_core::MAX_SAMPLES_PER_FRAME),
+            decoder: crate::psram_buffer::boxed(nanomp3_core::Decoder::new()),
             output_len: 0,
             output_pos: 0,
             seconds: 0,
@@ -750,9 +750,11 @@ impl Media {
     pub fn stop(&mut self, audio: &mut Audio) {
         if let Some(p) = self.video_player.take() {
             esp_println::println!(
-                "video playback stopped: {} displayed={} elapsed={}s",
+                "video playback stopped: {} last_frame={} decoded={} skipped={} elapsed={}s",
                 p.name,
                 p.displayed,
+                p.decoded,
+                p.skipped,
                 p.seconds
             );
             if let Some(s) = &self.storage {

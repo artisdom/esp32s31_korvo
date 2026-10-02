@@ -1,3 +1,60 @@
+#[cfg(test)]
+extern crate self as esp_println;
+#[cfg(test)]
+#[macro_export]
+macro_rules! println { ($($arg:tt)*) => { std::println!($($arg)*) }; }
+#[cfg(test)]
+#[path = "../../../src/video_player.rs"]
+mod video_player;
+#[cfg(test)]
+mod storage {
+    pub type Name = heapless::String<13>;
+    pub struct Storage {
+        pub fs: embedded_sdmmc::VolumeManager<crate::integration::Disk, crate::integration::Clock>,
+        pub root: embedded_sdmmc::RawDirectory,
+    }
+}
+#[cfg(test)]
+mod audio {
+    pub struct Audio {
+        pub queued_bytes: usize,
+        pub accepted: Vec<u8>,
+        pub played: usize,
+        pub gaps: usize,
+        pub expected: usize,
+    }
+    impl Audio {
+        pub fn new(expected: usize) -> Self {
+            Self {
+                queued_bytes: 0,
+                accepted: Vec::new(),
+                played: 0,
+                gaps: 0,
+                expected,
+            }
+        }
+        pub fn queued(&mut self) -> usize {
+            self.queued_bytes
+        }
+        pub fn free(&mut self) -> usize {
+            65536 - self.queued_bytes
+        }
+        pub fn queue(&mut self, bytes: &[u8]) -> usize {
+            let n = bytes.len().min(self.free());
+            self.accepted.extend_from_slice(&bytes[..n]);
+            self.queued_bytes += n;
+            n
+        }
+        pub fn advance(&mut self, n: usize) {
+            if self.queued_bytes < n && self.accepted.len() < self.expected {
+                self.gaps += 1;
+            }
+            let n = n.min(self.queued_bytes);
+            self.queued_bytes -= n;
+            self.played += n;
+        }
+    }
+}
 #[path = "../../../src/avi.rs"]
 mod avi;
 #[path = "../../../src/avi_playback.rs"]
@@ -24,7 +81,7 @@ mod integration {
         io::{Read, Seek, SeekFrom, Write},
         process::Command,
     };
-    struct Disk {
+    pub(crate) struct Disk {
         file: RefCell<File>,
         layout: fat_layout::Layout,
     }
@@ -65,7 +122,7 @@ mod integration {
             ))
         }
     }
-    struct Clock;
+    pub(crate) struct Clock;
     impl TimeSource for Clock {
         fn get_timestamp(&self) -> Timestamp {
             Timestamp {
@@ -363,6 +420,103 @@ mod integration {
             "{}",
             String::from_utf8_lossy(&decode.stderr)
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sd_video_stream_keeps_pcm_continuous_when_decoder_is_slower_than_video() {
+        let path =
+            std::env::temp_dir().join(format!("korvo-video-stream-{}.img", std::process::id()));
+        let mut disk = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        disk.set_len(64 * 1024 * 1024).unwrap();
+        assert!(
+            Command::new("mkfs.fat")
+                .args(["-F", "32"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut boot = [0; 512];
+        disk.read_exact(&mut boot).unwrap();
+        let fs = VolumeManager::new(
+            Disk {
+                file: RefCell::new(disk),
+                layout: fat_layout::Layout::detect(&boot, 64 * 1024 * 1024 / 512),
+            },
+            Clock,
+        );
+        let v = fs.open_raw_volume(VolumeIdx(0)).unwrap();
+        let root = fs.open_root_dir(v).unwrap();
+        let file = fs
+            .open_file_in_dir(root, "VIDTEST.AVI", Mode::ReadWriteCreate)
+            .unwrap();
+        let count = 40;
+        let rgb = vec![127; avi::WIDTH * avi::HEIGHT * 3];
+        let mut jpeg = Vec::new();
+        jpeg_encoder::Encoder::new(&mut jpeg, 45)
+            .encode(
+                &rgb,
+                avi::WIDTH as u16,
+                avi::HEIGHT as u16,
+                jpeg_encoder::ColorType::Rgb,
+            )
+            .unwrap();
+        let movi = count * (8 + jpeg.len() as u32 + (jpeg.len() as u32 & 1) + 8 + 38400);
+        fs.write(file, &avi::header(324 + movi, count, count * 38400, movi))
+            .unwrap();
+        let mut expected = Vec::new();
+        for frame in 0..count {
+            fs.write(file, &avi::chunk_header(true, jpeg.len() as u32))
+                .unwrap();
+            fs.write(file, &jpeg).unwrap();
+            if jpeg.len() & 1 != 0 {
+                fs.write(file, &[0]).unwrap();
+            }
+            fs.write(file, &avi::chunk_header(false, 38400)).unwrap();
+            let pcm = vec![frame as u8; 38400];
+            fs.write(file, &pcm).unwrap();
+            expected.extend_from_slice(&pcm);
+        }
+        fs.close_file(file).unwrap();
+        let storage = storage::Storage { fs, root };
+        let worker = Box::leak(Box::new(jpeg_decoder::Worker::new()));
+        let name = storage::Name::try_from("VIDTEST.AVI").unwrap();
+        let mut player = video_player::Player::new(&storage, name, worker, 11).unwrap();
+        let mut audio = audio::Audio::new(expected.len());
+        // Read-ahead before clocks consume the first PCM. Simulated 2 ms loop
+        // and 300 ms decoding: the video worker cannot sustain the 5 fps file.
+        for _ in 0..100 {
+            assert!(!player.poll(&storage, &mut audio).unwrap());
+        }
+        let mut complete = false;
+        for tick in 0..6000 {
+            if tick % 150 == 0 {
+                worker.run();
+            }
+            if player.poll(&storage, &mut audio).unwrap() {
+                complete = true;
+                break;
+            }
+            audio.advance(384);
+        }
+        assert!(complete, "stream stalled");
+        assert_eq!(audio.accepted, expected, "PCM was dropped or reordered");
+        assert_eq!(audio.gaps, 0, "JPEG decoding held up PCM");
+        assert!(
+            player.skipped > 0,
+            "slow video worker should drop old pending images"
+        );
+        assert!(player.decoded < count);
+        assert_eq!(player.displayed, count);
+        storage.fs.close_file(player.file).unwrap();
+        drop(player);
+        drop(storage);
         std::fs::remove_file(path).unwrap();
     }
     #[test]

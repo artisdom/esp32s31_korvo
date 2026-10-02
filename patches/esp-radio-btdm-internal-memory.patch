@@ -1,0 +1,24 @@
+diff --git a/esp-radio/src/ble/btdm2/mod.rs b/esp-radio/src/ble/btdm2/mod.rs
+index 6ee8d6089..0926b9e16 100644
+--- a/esp-radio/src/ble/btdm2/mod.rs
++++ b/esp-radio/src/ble/btdm2/mod.rs
+@@ -944,7 +944,7 @@ fn event_inner(ev: *mut BtdmOsalPtr) -> &'static mut Event {
+ }
+ 
+ fn alloc<T>() -> *mut T {
+-    unsafe { crate::compat::malloc::calloc(1, size_of::<T>()).cast() }
++    unsafe { crate::compat::malloc::calloc_internal(1, size_of::<T>()).cast() }
+ }
+ 
+ fn free_ptr(ptr: *mut c_void) {
+@@ -1553,7 +1553,9 @@ extern "C" fn wr_btdm_osal_intr_free(_handle: *mut c_void) -> i32 {
+ 
+ #[unsafe(no_mangle)]
+ extern "C" fn wr_btdm_osal_malloc(size: u32, _flags: u32) -> *mut c_void {
+-    unsafe { crate::compat::malloc::malloc(size as usize).cast() }
++    // S31/H4 controller link descriptors compress pointers relative to internal
++    // RAM. Generic malloc can return PSRAM under load, which cannot be encoded.
++    unsafe { crate::compat::malloc::malloc_internal(size as usize).cast() }
+ }
+ 
+ #[unsafe(no_mangle)]

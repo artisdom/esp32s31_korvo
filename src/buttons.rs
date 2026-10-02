@@ -27,6 +27,8 @@ pub struct Buttons {
     adc: Adc<'static, ADC1<'static>, esp_hal::Blocking>,
     pin: AdcPin<GPIO42<'static>, ADC1<'static>>,
     state: Debouncer,
+    sample_sum: u32,
+    sample_count: u32,
     /// Millivolts of the last sample (for the UI).
     pub last_mv: u16,
     /// Last raw code (diagnostics).
@@ -43,30 +45,39 @@ impl Buttons {
             adc,
             pin,
             state: Debouncer::new(),
+            sample_sum: 0,
+            sample_count: 0,
             last_mv: 0,
             last_raw: 0,
         }
     }
 
-    fn sample_mv(&mut self) -> u16 {
-        let mut sum_mv = 0u32;
-        for _ in 0..SAMPLE_COUNT {
-            let raw = self.adc.read_blocking(&mut self.pin);
-            self.last_raw = raw;
-            sum_mv += raw_to_mv(raw) as u32;
-        }
-        (sum_mv / SAMPLE_COUNT) as u16
-    }
-
-    /// Poll the ladder; return a debounced press edge and track releases.
+    /// Poll conversions without spinning: radio calibration can temporarily
+    /// own/reconfigure SAR. Waiting here would stall media and all task futures.
     pub fn poll(&mut self) -> Option<Button> {
-        self.last_mv = self.sample_mv();
-        self.state.update(
-            decode(self.last_mv),
-            esp_hal::time::Instant::now()
-                .duration_since_epoch()
-                .as_millis(),
-        )
+        // A bounded burst keeps four-sample debounce responsive even when
+        // camera capture reduces the loop rate. A pending SAR never blocks.
+        for _ in 0..8 {
+            let Ok(raw) = self.adc.read_oneshot(&mut self.pin) else {
+                continue;
+            };
+            self.last_raw = raw;
+            self.sample_sum += raw_to_mv(raw) as u32;
+            self.sample_count += 1;
+            if self.sample_count < SAMPLE_COUNT {
+                continue;
+            }
+            self.last_mv = (self.sample_sum / SAMPLE_COUNT) as u16;
+            self.sample_sum = 0;
+            self.sample_count = 0;
+            return self.state.update(
+                decode(self.last_mv),
+                esp_hal::time::Instant::now()
+                    .duration_since_epoch()
+                    .as_millis(),
+            );
+        }
+        None
     }
 
     /// Currently held button, if any.

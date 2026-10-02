@@ -134,3 +134,14 @@ src/
 ├── buttons.rs    — ADC ladder decode
 └── led.rs        — WS2812 via RMT
 ```
+
+## BTDM internal-memory follow-up
+
+Optional Wi-Fi/BLE media operation also requires the S31 controller allocator
+fix in local `esp-hal` commit `d5313cb1d`. See
+[radio memory and validation](16-radio-support.md#internal-ram-and-media-coexistence).
+For a compatible fresh HAL checkout, run
+`scripts/apply-btdm-memory-fix.sh /path/to/esp-hal` from this app repository.
+The app disables esp-alloc's default global allocator and supplies one that
+places JPEG worker allocations on core 1 in PSRAM; the HAL heap still provides
+explicit internal controller/DMA allocations and owns all deallocations.

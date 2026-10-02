@@ -20,3 +20,33 @@ pub fn zeroed(len: usize) -> Box<[u8]> {
         Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
     }
 }
+
+/// Typed microphone/decoder allocations preserve their exact layout on free.
+#[cfg(target_arch = "riscv32")]
+pub fn samples(len: usize) -> Box<[i16]> {
+    let layout = Layout::array::<i16>(len).expect("sample buffer layout");
+    let ptr =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) }
+            as *mut i16;
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        ptr.write_bytes(0, len);
+        Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
+    }
+}
+#[cfg(target_arch = "riscv32")]
+pub fn boxed<T>(value: T) -> Box<T> {
+    let layout = Layout::new::<T>();
+    let ptr =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) }
+            as *mut T;
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        ptr.write(value);
+        Box::from_raw(ptr)
+    }
+}

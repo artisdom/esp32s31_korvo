@@ -23,7 +23,7 @@ esp-backtrace = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-backtrace", featu
 esp-bootloader-esp-idf = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-bootloader-esp-idf", features = ["esp32s31"] }
 esp-rtos = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-rtos", features = ["esp32s31", "embassy"] }
 esp-println = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-println", default-features = false, features = ["esp32s31", "uart", "critical-section"] }
-esp-alloc = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-alloc", features = ["esp32s31"] }
+esp-alloc = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-alloc", default-features = false, features = ["esp32s31", "compat"] }
 
 # SD/MMC card protocol + FAT filesystem -----------------------------------
 sdio                = "0.5"

@@ -73,7 +73,7 @@ and JPEG buffers explicitly use the PSRAM heap. JPEG quality is 45.
 
 ## Validation, 2026-10-03
 
-The host media suite has 17 passing tests, including an AVI decoded by
+The host media suite has 18 passing tests, including an AVI decoded by
 FFmpeg/ffprobe, odd-length JPEG chunk padding, matching one-second audio/video
 streams, and cross-thread JPEG mailbox ownership and generation checks.
 
@@ -108,12 +108,19 @@ the whole recording is never loaded into RAM. Pure Rust `zune-jpeg` decodes
 on core 1 into RGB565 in PSRAM. A generation and frame index accompany every
 job, so STOP/restart cannot reuse an earlier session's image.
 
-Three decoded frames can be prefetched. The number of PCM bytes queued minus
+Three decoded frames and three compressed frames can be prefetched. JPEG
+jobs do not hold the SD reader at a video chunk: it continues to the following
+PCM. If the decoder falls behind, the oldest compressed pending image is
+replaced. Playback preserves microphone audio and advances video by its source
+frame timestamp. Completed/skipped decode counts are printed at STOP. The number of PCM bytes queued minus
 bytes remaining in I2S DMA determines the playback time and which frame is due.
 Playback pauses live DVP capture; changing tabs keeps the file playing and
 returning to CAMERA draws the current decoded frame. LCD painting defers while
-the decoder owns the mailbox, excluding simultaneous cache-heavy writes on
-both cores. Pending frame changes survive that deferral.
+the decoder or encoder owns the output guard, excluding simultaneous
+cache-heavy writes on both cores. Private allocations made by Rust JPEG
+libraries on core 1 use PSRAM through the application's allocator; media
+staging/sample/MP3-decoder buffers also use PSRAM. Radio controller allocations
+retain internal RAM through the dependency patch described in radio docs. Pending frame changes survive that deferral.
 
 Microphone draining was increased from 8 KiB to 32 KiB per loop, with the
 scratch buffer in PSRAM, and silent/tone TX fills all available 8 KiB blocks.
@@ -130,3 +137,21 @@ paint/decode exclusion added above; the revised build replayed all 165 frames wi
 both staying zero. Its one TX underrun occurred before playback.
 Physical confirmation of motion, intelligible speech and A/V alignment remains
 pending. Automated console tests do not establish those perceptual checks.
+
+The final combined Wi-Fi/BLE build replayed `VID00012.AVI` with **165 decodes,
+zero skipped images and zero LCD underruns**, while a BLE client read uptime
+and received five notifications and TCP echo handled ten payloads. TX underruns
+stayed at the two-startup-event baseline throughout playback; one additional
+TX event was counted at completion. RX overruns stayed at the one-startup-event
+baseline. Internal heap remained about 21–24 KiB free during this test.
+
+A fresh record/save/replay cycle produced `VID00013.AVI`: 55 frames, 2105344
+PCM bytes (10.965 s) and 2221050 total bytes. All 55 frames decoded without
+skips. LCD underruns stayed zero; no additional microphone RX overruns or TX
+underruns occurred while recording and replaying. These hardware checks use
+the default CPU clock, not the experimental higher-clock build.
+
+The host suite now streams an actual FAT-backed AVI through the production
+player and a simulated 64 KiB DMA queue with 300 ms JPEG completion latency,
+slower than the 5 fps file. It checks that PCM is delivered unchanged and
+without gaps, older video jobs are bounded/dropped and the final frame arrives.

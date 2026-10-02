@@ -24,6 +24,9 @@ pub struct Player {
     decode_pending: bool,
     frames: heapless::Deque<(u32, Vec<u8>), 3>,
     next_frame: u32,
+    compressed: heapless::Deque<(u32, Vec<u8>), 3>,
+    pub decoded: u32,
+    pub skipped: u32,
     submitted: u32,
     pub image: Option<Vec<u8>>,
     pub changed: bool,
@@ -80,6 +83,9 @@ impl Player {
             decode_pending: false,
             frames: heapless::Deque::new(),
             next_frame: 0,
+            compressed: heapless::Deque::new(),
+            decoded: 0,
+            skipped: 0,
             submitted: 0,
             image: None,
             changed: false,
@@ -92,6 +98,7 @@ impl Player {
         if let Some((generation, index, result)) = self.decoder.take() {
             if generation == self.generation {
                 self.decode_pending = false;
+                self.decoded += 1;
                 self.frames
                     .push_back((index, result?))
                     .map_err(|_| "AVI prefetch overflow")?;
@@ -107,6 +114,14 @@ impl Player {
             self.changed = true;
             self.displayed = index + 1;
         }
+        if !self.decode_pending && self.decoder.idle() && self.frames.len() < 3 {
+            if let Some((index, jpeg)) = self.compressed.pop_front() {
+                if !self.decoder.submit(&jpeg, self.generation, index) {
+                    return Err("AVI decoder unavailable");
+                }
+                self.decode_pending = true;
+            }
+        }
         if self.consumed < self.pending {
             let n = audio.queue(&self.pcm[self.consumed..self.pending]);
             self.consumed += n;
@@ -120,7 +135,10 @@ impl Player {
                 {
                     return Err("AVI media lengths disagree");
                 }
-                return Ok(!self.decode_pending && self.frames.is_empty() && audio.queued() < 2048);
+                return Ok(self.compressed.is_empty()
+                    && !self.decode_pending
+                    && self.frames.is_empty()
+                    && audio.queued() < 2048);
             }
             if self
                 .position
@@ -144,9 +162,6 @@ impl Player {
         let chunk = self.chunk.as_mut().unwrap();
         match chunk.kind {
             Kind::Video => {
-                if self.decode_pending || !self.decoder.idle() || self.frames.len() >= 3 {
-                    return Ok(false);
-                }
                 let n = chunk.bytes as usize;
                 if s.fs
                     .read(self.file, &mut self.jpeg[..n])
@@ -155,13 +170,16 @@ impl Player {
                 {
                     return Err("AVI JPEG truncated");
                 }
-                if !self
-                    .decoder
-                    .submit(&self.jpeg[..n], self.generation, self.next_frame)
-                {
-                    return Err("AVI decoder unavailable");
+                // Continue to following PCM while JPEG is busy. Bounded
+                // compressed prefetch drops its oldest pending image if the
+                // decoder falls behind; audio must never wait for video work.
+                if self.compressed.is_full() {
+                    self.compressed.pop_front();
+                    self.skipped += 1;
                 }
-                self.decode_pending = true;
+                let mut jpeg = crate::psram_buffer::zeroed(n).into_vec();
+                jpeg.copy_from_slice(&self.jpeg[..n]);
+                let _ = self.compressed.push_back((self.next_frame, jpeg));
                 self.next_frame += 1;
                 chunk.bytes = 0;
             }

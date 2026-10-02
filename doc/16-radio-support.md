@@ -213,3 +213,39 @@ release builds compile/link; all 344 upstream Zigbee workspace host tests pass;
 two dedicated partition guard tests reject overlaps, missing/duplicate entries,
 incorrect partition types and overflowing ranges. These checks do not replace
 a coordinator commissioning/interview test.
+
+## Internal RAM and media coexistence
+
+The S31 controller uses compressed pointers relative to internal SRAM. Its
+BTDM2 generic `malloc` callback could spill into PSRAM under media load and
+produced an invalid-memory-access crash during a BLE connection. The local
+`esp-hal` dependency commit `d5313cb1d` routes controller/OSAL allocations to
+internal RAM. The reproducible patch is
+`patches/esp-radio-btdm-internal-memory.patch`; apply it to a compatible checkout
+with `scripts/apply-btdm-memory-fix.sh /path/to/esp-hal`. That script checks for
+an already-applied fix before making changes.
+
+The application supplies its own global allocator: core 1's private JPEG
+allocations use PSRAM, while core 0 retains the usual allocator and explicit
+controller/DMA allocations stay internal. Media staging, samples and MP3
+state are explicitly external. Without that policy, JPEG decoding left only
+about 1 KiB internal heap and TCP timed out; the revised test kept 21–24 KiB
+free. `zigbee-mac`'s optional allocator dependency has default features disabled
+so it cannot install a conflicting global allocator. The updated port patch
+includes that manifest change (local dependency commit `9d7d377`).
+
+Buttons use bounded, nonblocking SAR conversion polling. A pending ADC
+conversion previously held the main loop and prevented media commands and
+network futures from running during some radio boots. Four-sample averaging
+and the existing 20 ms debounce are retained. SAR ownership/arbitration needs
+further target-driver investigation; the UI loop now yields when conversion
+has not completed.
+
+The final playback/coexistence check connected to Wi-Fi, acquired DHCP, echoed
+ten TCP payloads and delivered five BLE GATT notifications **during** replay
+of a 33-second AVI. All 165 images decoded without skips; LCD underruns stayed
+zero and audio DMA counters stayed at their startup baselines during playback.
+A new 55-frame camera/microphone recording then saved and replayed cleanly in
+this build, without additional recording/playback DMA faults. Earlier DHCP
+and CPU-lockup observations are retained as experimental-driver limitations;
+these successful checks do not establish long-duration reliability.

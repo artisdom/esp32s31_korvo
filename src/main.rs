@@ -26,6 +26,7 @@ use esp_hal::{
 use esp_println::println;
 use static_cell::StaticCell;
 
+mod app_allocator;
 mod audio;
 mod audio_ring;
 mod avi;
@@ -48,7 +49,11 @@ mod led;
 mod media;
 mod pcm;
 mod psram_buffer;
-#[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154", feature = "radio-zigbee"))]
+#[cfg(any(
+    feature = "radio-wifi-ble",
+    feature = "radio-802154",
+    feature = "radio-zigbee"
+))]
 mod radio;
 mod sc101iot_regs;
 mod sdcard;
@@ -118,8 +123,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
     #[cfg(feature = "radio-802154")]
     _spawner.spawn(radio::ieee_task(peripherals.IEEE802154).expect("spawn 802.15.4"));
     #[cfg(feature = "radio-zigbee")]
-    _spawner.spawn(radio::zigbee_task(peripherals.IEEE802154, peripherals.FLASH).expect("spawn Zigbee"));
-    #[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154", feature = "radio-zigbee"))]
+    _spawner.spawn(
+        radio::zigbee_task(peripherals.IEEE802154, peripherals.FLASH).expect("spawn Zigbee"),
+    );
+    #[cfg(any(
+        feature = "radio-wifi-ble",
+        feature = "radio-802154",
+        feature = "radio-zigbee"
+    ))]
     Timer::after_millis(100).await;
     // --- RGB LCD + PSRAM framebuffer ---------------------------------------------------
     let fb: &'static mut [u8] = alloc_fb().expect("framebuffer alloc");
@@ -612,6 +623,11 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 buttons.last_raw,
                 esp_alloc::HEAP.free() / 1024
             );
+            #[cfg(feature = "radio-wifi-ble")]
+            println!(
+                "radio internal heap: {} bytes free",
+                esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into())
+            );
             display::log_stats();
             audio.log_stats();
             if let Some(camera) = camera_stream.as_ref() {
@@ -650,7 +666,8 @@ fn alloc_fb() -> Option<&'static mut [u8]> {
 #[embassy_executor::task]
 async fn jpeg_task(worker: &'static jpeg_worker::Worker, decoder: &'static jpeg_decoder::Worker) {
     loop {
-        worker.encode();
+        // Reuse the LCD guard for encoder scratch writes as well.
+        decoder.paint(|| worker.encode());
         decoder.run();
         embassy_time::Timer::after_millis(2).await;
     }

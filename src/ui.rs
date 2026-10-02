@@ -58,6 +58,7 @@ pub struct AppStatus {
     pub fps: u32,
     pub touch_point: Option<(u16, u16)>,
     pub flash_led: bool,
+    pub led_rgb: (u8, u8, u8),
 }
 
 const HEADER_H: usize = 44;
@@ -339,7 +340,7 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     // Buttons: mv + bar + held states
     {
         let card = Card::at(8, ROW2_Y, CW, CH2);
-        let r = card.begin_dyn(c, 6, 28, 246, 74);
+        let r = card.begin_dyn(c, 6, 28, 246, 146);
         let mut s: heapless::String<32> = heapless::String::new();
         let _ = write!(s, "GPIO42: {} mV", st.btn_mv);
         c.text(card.x + 12, card.y + 32, &s, gfx::TEXT, 1);
@@ -349,11 +350,16 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
             let on = st.btn_held == Some(*b);
             c.rect(
                 card.x + 14,
-                card.y + 66 + i * 18,
+                card.y + 106 + i * 18,
                 10,
                 10,
                 if on { gfx::ACCENT } else { gfx::PANEL_HI },
             );
+            // begin_dyn cleared this whole area, including the static labels.
+            let mut label: heapless::String<24> = heapless::String::new();
+            let _ = write!(label, "{:<4} {:4}mV", b.label(), crate::button_logic::CENTERS_MV[i]);
+            c.text(card.x + 30, card.y + 104 + i * 18, &label,
+                if on { gfx::TEXT } else { gfx::MUTED }, 1);
         }
         d.push(r).ok();
     }
@@ -388,13 +394,14 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     {
         let card = Card::at(8 + 2 * (CW + GAP), ROW2_Y, CW, CH2);
         let r = card.begin_dyn(c, 6, 60, 48, 72);
-        let color = if st.flash_led { gfx::ACCENT } else { gfx::PANEL_HI };
+        let (red, green, blue) = st.led_rgb;
+        let color = gfx::rgb565(red, green, blue);
         c.circle(card.x + 28, card.y + 96, 20, color);
         c.circle(
             card.x + 28,
             card.y + 96,
             12,
-            if st.flash_led { gfx::WARN } else { gfx::PANEL },
+            if st.flash_led { gfx::WARN } else { color },
         );
         d.push(r).ok();
     }
@@ -653,7 +660,7 @@ fn page_about_static(c: &mut Canvas, st: &AppStatus) {
             },
         ),
         ("WS2812 LED (RMT)", "works"),
-        ("ADC button ladder", "upstream esp-hal bug - reads 0"),
+        ("ADC button ladder", "debounced; 0 raw = idle"),
         ("USB HS CDC (Type-A)", "works"),
         ("Wi-Fi/BLE/Thread", "upstream (esp-radio) - not yet"),
     ];

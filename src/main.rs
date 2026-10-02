@@ -29,6 +29,7 @@ use crate::{audio::Source, buttons::Button, ui::Page};
 mod audio;
 mod board;
 mod buttons;
+mod button_logic;
 mod camera;
 mod display;
 mod es8389;
@@ -304,6 +305,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         fps: 0,
         touch_point: None,
         flash_led: false,
+        led_rgb: (0, 0, 32),
     };
 
     let start = Instant::now();
@@ -318,16 +320,17 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let mut frame = 0u32;
     let mut fps_window = Instant::now();
     let mut fps = 0u32;
-    let mut led_phase: u8 = 0;
+    let mut led_tick = Instant::now();
+    let mut button_flash_until_ms = 0u64;
+    let mut previous_held = None;
     let mut tone_on = false;
 
     loop {
         LOOP_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // ---- buttons ----
-        st.flash_led = false;
         if let Some(btn) = buttons.poll() {
-            st.flash_led = true;
+            button_flash_until_ms = start.elapsed().as_millis() + 250;
             match btn {
                 Button::Mode => {
                     st.page = st.page.next();
@@ -353,6 +356,12 @@ async fn main(_spawner: embassy_executor::Spawner) {
         }
         st.btn_mv = buttons.last_mv;
         st.btn_held = buttons.held();
+        if st.btn_held != previous_held {
+            println!("button: {} raw={} mv={}",
+                st.btn_held.map(Button::label).unwrap_or("released"), buttons.last_raw, st.btn_mv);
+            previous_held = st.btn_held;
+        }
+        st.flash_led = start.elapsed().as_millis() < button_flash_until_ms;
 
         // ---- touch ----
         // Touch, rendering and dirty regions all use screen coordinates.
@@ -397,15 +406,25 @@ async fn main(_spawner: embassy_executor::Spawner) {
         }
 
         // ---- status LED: slow colour cycle, orange flash on key press ----
-        led_phase = led_phase.wrapping_add(2);
-        let (r, g, b) = if st.flash_led {
-            (0xff, 0x66, 0x00)
-        } else {
-            let w = led::wheel(led_phase);
-            ((w.0 as u16 * 4 / 10) as u8, (w.1 as u16 * 4 / 10) as u8, (w.2 as u16 * 4 / 10) as u8)
-        };
-        led.set(r, g, b);
-        led.update();
+        if led_tick.elapsed().as_millis() >= 20 {
+            led_tick = Instant::now();
+            let elapsed_ms = start.elapsed().as_millis();
+            let led_phase = (elapsed_ms / 20) as u8;
+            let (r, g, b) = if st.flash_led {
+                (0xff, 0x66, 0x00)
+            } else {
+                let w = led::wheel(led_phase);
+                let t = (elapsed_ms % 4000) as u32;
+                let triangle = if t < 2000 { t } else { 4000 - t };
+                let brightness = 16 + triangle * 84 / 2000;
+                ((w.0 as u32 * brightness / 255) as u8,
+                 (w.1 as u32 * brightness / 255) as u8,
+                 (w.2 as u32 * brightness / 255) as u8)
+            };
+            st.led_rgb = (r, g, b);
+            led.set(r, g, b);
+            led.update();
+        }
 
         // periodic heartbeat (time-based: `frame` resets every second)
         if st.uptime_s != 0 && st.uptime_s % 10 == 0 && frame == 1 {
@@ -420,6 +439,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 esp_alloc::HEAP.free() / 1024
             );
             display::log_stats();
+            println!("WS2812: RMT errors={}", led.error_count());
         }
         // ---- fps ----
         frame += 1;

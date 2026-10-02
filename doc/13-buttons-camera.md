@@ -40,12 +40,30 @@ The vendor BSP encodes this in `bsp_s31_adc_calibration_raw_to_mv()`:
 mv = 2000 - (4000 * code_q) / (4393 * SCALE);
 ```
 
-with `code_q` the weighted sum of the 17 SAR bits (weights sum to 4393):
-`{2048, 1024, 512, 256, 256, 128, 64, 32, 32, 16, 8, 8, 4, 2, 2, 0, 1}`, MSB
-first. `buttons.rs` ports both.
+The earlier implementation incorrectly treated the HAL result as a raw
+17-bit comparator pattern and applied weights again. A zero idle reading
+could not distinguish these representations. During the 2026-10-02 press
+test the board returned codes around 1803, 1353 and 827, consistent with
+already weighted codes, as documented by the local HAL's `FULL_SCALE`.
 
-Result: idle = 2000 mV, and VOL+/VOL-/MODE/SET land on 380/820/1340/1870 mV,
-the same thresholds the stock firmware uses.
+`buttons.rs` now converts the HAL code directly, averages four converted
+samples and uses `button_logic.rs` for midpoint voltage windows and 20 ms
+stable press/release debouncing. Direct changes between keys update the
+held state instead of leaving the previous key latched. Stable transitions
+log the label, last ADC code and averaged millivolts.
+
+The UI had a separate bug: static button indicators were at y+106 while
+dynamic indicators were drawn at y+66. The dirty rectangle stopped at
+y+102, excluding the real indicator rows. Dynamic rendering now redraws
+each label and indicator together and includes all four rows in writeback.
+
+Host tests exercise voltage decoding, measured codes, bounce rejection,
+one press per hold, direct key changes and release. Run:
+
+```sh
+rustc --edition=2024 --test src/button_logic.rs -o target/button-tests
+./target/button-tests
+```
 
 ### Local esp-hal change
 
@@ -98,3 +116,39 @@ OV3660 (0x3c, plain 16-bit addressing) is not populated on this unit.
 Note: only `DMA_AXI_CH0` is wired to LCD_CAM on this chip, and its TX half
 streams the LCD. `camera.rs` therefore hands the driver a second handle to the
 same channel for its RX half; it is never used because no transfer is started.
+
+## 3. WS2812 status LED
+
+GPIO37 and RMT channel 0 match the board BSP. The original frame contained
+24 GRB bits and a reset-low symbol, but no RMT end marker. The HAL rejects
+such a frame with `EndMarkerMissing`; the previous driver discarded errors,
+so the LED remained dark without a diagnostic.
+
+The frame now contains 24 GRB bits, a 300 us reset-low symbol and an explicit
+`PulseCode::end_marker()`. At the requested 10 MHz RMT rate, pulse durations
+are direct tick counts (zero: 300/900 ns, one: 900/300 ns), without subtracting
+one. The first transmission error is logged; cumulative errors appear in
+UART heartbeats.
+
+Updates run every 20 ms, with a time-based colour cycle and brightness pulse.
+Button press feedback lasts 250 ms rather than one main-loop iteration,
+so it is visible both on the LED and in the UI. The UI LED swatch uses the
+same requested RGB value. Successful RMT transfers do not by themselves
+prove the LED's physical colour output; check it on the board.
+
+### Hardware validation (2026-10-02)
+
+After flashing, stable press/release logs identified all four keys:
+
+| Key | Observed ADC code | Averaged voltage |
+|---|---|---|
+| VOL+ | 1809 | 353 mV |
+| VOL- | 1361 | 761 mV |
+| MODE | 835 | 1240 mV |
+| SET | 292 | 1734 mV |
+
+These are observed values on this board, not replacements for the vendor
+nominal centers used in the UI labels. Idle returned to raw 0 / 2000 mV.
+The capture reported zero RMT transmission errors and zero LCD underruns
+while keys were exercised. The user confirmed that button indicators and
+the physical LED both work, including orange feedback on presses.

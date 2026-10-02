@@ -21,8 +21,8 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | **works** — on-chip synthesized chime/test tone, 48 kHz/16-bit |
 | Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | `esp_hal::i2s` DMA + RMS meter | **partial** — DMA delivers samples; full-duplex clocking of the slave codec is not phase-locked in esp-hal yet, so sample quality is not guaranteed |
 | microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + hand-rolled read-only FAT inspector | **works** (verified with a 128 GB card) — card info, partition/FAT type, volume label, root dir listing, first `.TXT` preview. Never writes. |
-| WS2812 status LED | GPIO37 | `esp_hal::rmt` | **works** — colour-cycle breathing, orange flash on key press |
-| Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET, idle 2000 mV |
+| WS2812 status LED | GPIO37 | `esp_hal::rmt` | **works** — colour-cycle breathing, 250 ms orange flash on key press; explicit RMT end marker and error reporting |
+| Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
 | USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
 | DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: 20 MHz XCLK from LCD_CAM + paged SCCB | **detected** — PID 0xda4a; capture is future work |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
@@ -51,11 +51,11 @@ The four keys are a resistor ladder on **GPIO42 = `ADC1_CH0_N`** — the
 which is the **bottom** of the code range, so an untouched board legitimately
 reads raw `0`. Pressing a key lowers the ladder voltage and *raises* the code.
 
-The SAR's 17 comparator bits have non-uniform weights, so the code is a
-weighted sum, not the integer value. `buttons.rs` ports both the weight table
-and the code→voltage mapping from the vendor BSP's
-`esp32_s31_adc_calibration.c`, giving 2000 mV at idle and 380/820/1340/1870 mV
-for VOL+/VOL-/MODE/SET — the same thresholds the stock firmware uses.
+The HAL returns the SAR's already weighted code (0..4393). Convert it
+**directly** with `mv = 2000 - 4000 * code / 4393`; applying the comparator
+weights again misclassifies keys. `button_logic.rs` supplies midpoint
+voltage windows and 20 ms press/release debouncing. The UI updates the
+indicator beside each label and logs stable state changes over UART.
 
 This was verified against ESP-IDF itself: an IDF `adc_oneshot` app built from
 the local checkout reads raw 0 on the same channel, so the hardware and the

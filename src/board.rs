@@ -37,9 +37,9 @@ pub const LED_WS2812: u8 = 37;
 
 // --- ADC button ladder on GPIO42 (ADC1) -------------------------------------
 /// Idle voltage of the ladder when no key is pressed.
-pub const BUTTON_IDLE_MV: u16 = 2000;
+pub const BUTTON_IDLE_MV: u16 = crate::button_logic::IDLE_MV;
 /// Voltage at the centre of each key's window (from the BSP).
-pub const BUTTON_CENTER_MV: [u16; 4] = [380, 820, 1340, 1870];
+pub const BUTTON_CENTER_MV: [u16; 4] = crate::button_logic::CENTERS_MV;
 /// Index into [`BUTTON_CENTER_MV`].
 pub const BTN_VOLUP: usize = 0;
 pub const BTN_VOLDOWN: usize = 1;

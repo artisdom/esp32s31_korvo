@@ -6,18 +6,17 @@ use esp_hal::{
     rmt::{PulseCode, Rmt, Tx as RmtTx, TxChannelConfig, TxChannelCreator},
 };
 
-const RMT_FREQ_HZ: u64 = 10_000_000; // 100 ns ticks, like the stock driver
-
 /// T1H/T0H/T1L/T0L in 100 ns units (WS2812 timing).
-const T1H: u16 = 9 - 1;
-const T0H: u16 = 3 - 1;
-const T1L: u16 = 3 - 1;
-const T0L: u16 = 9 - 1;
-const RESET_TICKS: u16 = 300 - 1; // > 50 us low
+const T1H: u16 = 9;
+const T0H: u16 = 3;
+const T1L: u16 = 3;
+const T0L: u16 = 9;
+const RESET_TICKS: u16 = 1500; // 150 us per half: 300 us low before end marker
 
 pub struct StatusLed {
     channel: Option<Channel>,
     pending: Option<(u8, u8, u8)>,
+    errors: u32,
 }
 
 type Channel = esp_hal::rmt::Channel<'static, esp_hal::Blocking, RmtTx>;
@@ -36,6 +35,7 @@ impl StatusLed {
         Ok(Self {
             channel: Some(channel),
             pending: None,
+            errors: 0,
         })
     }
 
@@ -44,8 +44,7 @@ impl StatusLed {
         self.pending = Some((r, g, b));
     }
 
-    /// Push the pending colour out on the wire (non-blocking fire-and-forget;
-    /// the caller is expected to call this at a few kHz at most).
+    /// Push the pending colour out and wait for the short RMT transfer.
     pub fn update(&mut self) {
         if let Some((r, g, b)) = self.pending.take() {
             self.send(r, g, b);
@@ -54,7 +53,7 @@ impl StatusLed {
 
     pub fn send(&mut self, r: u8, g: u8, b: u8) {
         // GRB order, MSB first.
-        let mut codes = [PulseCode::new(Level::High, 0, Level::Low, 0); 25];
+        let mut codes = [PulseCode::end_marker(); 26];
         let mut idx = 0;
         for byte in [g, r, b] {
             for bit in (0..8).rev() {
@@ -71,10 +70,26 @@ impl StatusLed {
             match channel.transmit(&codes) {
                 Ok(tx) => match tx.wait() {
                     Ok(ch) => self.channel = Some(ch),
-                    Err((_e, ch)) => self.channel = Some(ch),
+                    Err((e, ch)) => {
+                        self.channel = Some(ch);
+                        self.record_error(e);
+                    }
                 },
-                Err((_e, ch)) => self.channel = Some(ch),
+                Err((e, ch)) => {
+                    self.channel = Some(ch);
+                    self.record_error(e);
+                }
             }
+        }
+    }
+    pub fn error_count(&self) -> u32 {
+        self.errors
+    }
+
+    fn record_error(&mut self, error: esp_hal::rmt::Error) {
+        self.errors += 1;
+        if self.errors == 1 {
+            esp_println::println!("WS2812 RMT error: {}", error);
         }
     }
 }
@@ -92,4 +107,3 @@ pub fn wheel(pos: u8) -> (u8, u8, u8) {
         (p * 3, 0, 255 - p * 3)
     }
 }
-

@@ -60,10 +60,10 @@ Voltage ladder (0 dB attenuation, 2 V full-scale):
   MODE            = 1340 mV
   SET             = 1870 mV
 
-The SAR's 17 bits are non-uniformly weighted, so the code is the weighted sum
-of the set bits (weights sum to 4393), and
+The HAL returns the already weighted code (0..4393), so apply directly:
     mv = 2000 - 4000 * code / 4393
-Both come from the vendor BSP's esp32_s31_adc_calibration.c.
+Do not interpret this result as a comparator bit pattern and weight it again.
+The GPIO42 voltage mapping is inverted because it is the negative input.
 ```
 
 ### microSD (SDMMC 4-bit)

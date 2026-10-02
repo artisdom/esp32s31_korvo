@@ -10,7 +10,9 @@ embassy-executor = "0.10"
 embassy-futures  = "0.1"
 embassy-sync     = "0.8"
 embassy-time     = "0.5"
-embassy-usb      = { version = "0.6", default-features = false }
+embassy-usb      = { version = "0.6", default-features = false, optional = true }
+embassy-usb-host = { path = "/home/nws/w/esp32/embassy-usb-host/embassy-usb-host", optional = true }
+embassy-usb-driver = "0.2.2"
 
 # esp-rs stack ------------------------------------------------------------
 # esp-hal stable (1.2.x) does not contain ESP32-S31 support yet: the I2S,
@@ -53,6 +55,10 @@ esp-storage = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-storage", features 
 embassy-embedded-hal = { version = "0.6", optional = true }
 
 [patch.crates-io]
+embassy-usb = { path = "/home/nws/w/esp32/embassy-usb-host/embassy-usb" }
+embassy-usb-driver = { path = "/home/nws/w/esp32/embassy-usb-host/embassy-usb-driver" }
+embassy-usb-synopsys-otg = { path = "/home/nws/w/esp32/embassy-usb-host/embassy-usb-synopsys-otg" }
+embassy-sync = { path = "/home/nws/w/esp32/embassy-usb-host/embassy-sync" }
 esp-wifi-sys-esp32s31 = { path = "/home/nws/w/esp32/esp-rs/esp-wifi-sys-s31-classic" }
 esp-hal = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-hal" }
 esp-radio = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-radio" }
@@ -60,7 +66,9 @@ esp-sync = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-sync" }
 esp-alloc = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-alloc" }
 
 [features]
-default = []
+default = ["usb-host"]
+usb-host = ["dep:embassy-usb-host"]
+usb-device = ["dep:embassy-usb"]
 radio-classic = ["dep:esp-radio", "esp-radio/classic", "esp-rtos/esp-radio"]
 radio-wifi-ble = ["dep:esp-radio", "esp-radio/wifi", "esp-radio/ble", "esp-radio/coex", "esp-rtos/esp-radio", "dep:embassy-net", "dep:trouble-host"]
 radio-zigbee = ["dep:zigbee", "dep:zigbee-mac", "dep:esp-storage", "dep:embassy-embedded-hal", "dep:esp-radio", "esp-radio/ieee802154", "esp-rtos/esp-radio"]

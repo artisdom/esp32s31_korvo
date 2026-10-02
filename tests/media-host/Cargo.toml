@@ -11,3 +11,5 @@ jpeg-encoder = { version = "0.7.1", default-features = false }
 zune-jpeg = { version = "0.5.15", default-features = false }
 
 heapless = "0.8"
+
+embassy-usb-host = {path="/home/nws/w/esp32/embassy-usb-host/embassy-usb-host"}

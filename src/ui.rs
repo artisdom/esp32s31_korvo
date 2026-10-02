@@ -17,14 +17,16 @@ pub enum Page {
     Audio,
     Storage,
     Camera,
+    Usb,
     About,
 }
 
-pub const PAGES: [(Page, &str); 5] = [
+pub const PAGES: [(Page, &str); 6] = [
     (Page::Home, "HOME"),
     (Page::Audio, "AUDIO"),
     (Page::Storage, "SD CARD"),
     (Page::Camera, "CAMERA"),
+    (Page::Usb, "USB"),
     (Page::About, "ABOUT"),
 ];
 
@@ -48,6 +50,7 @@ pub struct AppStatus {
     pub usb_connected: bool,
     pub usb_rx: u32,
     pub usb_tx: u32,
+    pub usb_input: crate::usb_input::Snapshot,
     pub sd: Option<sdcard::SdReport>,
     pub btn_mv: u16,
     pub btn_held: Option<Button>,
@@ -135,6 +138,7 @@ impl Card {
 
 /// Full page redraw: static chrome + current dynamic values.
 pub fn draw(c: &mut Canvas, st: &AppStatus) {
+    LAST_CURSOR.store(0, core::sync::atomic::Ordering::Relaxed);
     c.fill(gfx::BG);
     draw_header_static(c);
     draw_header_dyn(c, st);
@@ -144,6 +148,7 @@ pub fn draw(c: &mut Canvas, st: &AppStatus) {
         Page::Audio => page_audio_static(c, st),
         Page::Storage => page_storage_static(c, st),
         Page::Camera => page_camera_static(c, st),
+        Page::Usb => page_usb_static(c),
         Page::About => page_about_static(c, st),
     }
     let mut d = Dirty::new();
@@ -152,27 +157,25 @@ pub fn draw(c: &mut Canvas, st: &AppStatus) {
         Page::Audio => page_audio_dyn(c, st, &mut d),
         Page::Storage => page_storage_dyn(c, st, &mut d),
         Page::Camera => page_camera_dyn(c, st, &mut d),
+        Page::Usb => page_usb_dyn(c, st, &mut d),
         Page::About => page_about_dyn(c, st, &mut d),
     }
-    draw_cursor(c, st.touch_point, None);
-    LAST_CURSOR.store(
-        pack_cursor(st.touch_point),
-        core::sync::atomic::Ordering::Relaxed,
-    );
 }
 
 /// Repaint only the dynamic widgets; returns the regions touched.
 pub fn draw_dynamic(c: &mut Canvas, st: &AppStatus) -> Dirty {
     let mut d = Dirty::new();
+
     d.push(draw_header_dyn(c, st)).ok();
     match st.page {
         Page::Home => page_home_dyn(c, st, &mut d),
         Page::Audio => page_audio_dyn(c, st, &mut d),
         Page::Storage => page_storage_dyn(c, st, &mut d),
         Page::Camera => page_camera_dyn(c, st, &mut d),
+        Page::Usb => page_usb_dyn(c, st, &mut d),
         Page::About => page_about_dyn(c, st, &mut d),
     }
-    draw_cursor(c, st.touch_point, Some(&mut d));
+
     d
 }
 
@@ -242,6 +245,13 @@ fn draw_tabs(c: &mut Canvas, st: &AppStatus) {
 
 // ---------------------------------------------------------------- cursor
 
+/// Cursor updates are outside widget/video painting so its XOR backing remains intact.
+pub fn cursor(c: &mut Canvas, point: Option<(u16, u16)>) -> Dirty {
+    let mut dirty = Dirty::new();
+    draw_cursor(c, point, Some(&mut dirty));
+    dirty
+}
+
 fn draw_cursor(c: &mut Canvas, cur: Option<(u16, u16)>, mut dirty: Option<&mut Dirty>) {
     use core::sync::atomic::Ordering;
     let last = unpack_cursor(LAST_CURSOR.load(Ordering::Relaxed));
@@ -250,6 +260,7 @@ fn draw_cursor(c: &mut Canvas, cur: Option<(u16, u16)>, mut dirty: Option<&mut D
     }
     if let Some((x, y)) = last {
         c.xor_ring(x as usize, y as usize, 9);
+        c.xor_ring(x as usize, y as usize, 4);
         if let Some(d) = dirty.as_deref_mut() {
             d.push(Rect::new(
                 x.saturating_sub(10) as usize,
@@ -361,15 +372,29 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
         c.text(btn.x + 30, btn.y + 104 + i * 18, n, gfx::MUTED, 1);
     }
 
-    let usb = Card::new(8 + CW + GAP, ROW2_Y, CW, CH2, c, "USB HS (Type-A)");
+    let usb = Card::new(8 + CW + GAP, ROW2_Y, CW, CH2, c, "USB (Type-A)");
     c.text(
         usb.x + 12,
         usb.y + 100,
-        "screen /dev/ttyACM0",
+        if cfg!(feature = "usb-host") {
+            "HUB + KEYBOARD + MOUSE"
+        } else {
+            "screen /dev/ttyACM0"
+        },
         gfx::MUTED,
         1,
     );
-    c.text(usb.x + 12, usb.y + 116, "send ? for info", gfx::MUTED, 1);
+    c.text(
+        usb.x + 12,
+        usb.y + 116,
+        if cfg!(feature = "usb-host") {
+            "open USB tab to test input"
+        } else {
+            "send ? for info"
+        },
+        gfx::MUTED,
+        1,
+    );
 
     let led = Card::new(
         8 + 2 * (CW + GAP),
@@ -594,7 +619,11 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
             card.x + 28,
             card.y + 24,
             if st.usb_connected {
-                "CDC-ACM up"
+                if cfg!(feature = "usb-host") {
+                    "USB host attached"
+                } else {
+                    "CDC-ACM up"
+                }
             } else {
                 "not connected"
             },
@@ -602,9 +631,21 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
             1,
         );
         let mut s: heapless::String<48> = heapless::String::new();
-        let _ = write!(s, "rx {} B  tx {} B", st.usb_rx, st.usb_tx);
+        if cfg!(feature = "usb-host") {
+            let _ = write!(
+                s,
+                "{} hubs {} keyboards {} mice",
+                st.usb_input.hubs, st.usb_input.keyboards, st.usb_input.mice
+            );
+        } else {
+            let _ = write!(s, "rx {} B  tx {} B", st.usb_rx, st.usb_tx);
+        }
         c.text(card.x + 12, card.y + 44, &s, gfx::MUTED, 1);
-        let last = crate::usb::USB_LAST_RX.read();
+        let last = if cfg!(feature = "usb-host") {
+            crate::usb::USB_REPORT.read()
+        } else {
+            crate::usb::USB_LAST_RX.read()
+        };
         let mut s2: heapless::String<64> = heapless::String::new();
         let _ = write!(s2, "last: {}", last.as_str());
         c.text(card.x + 12, card.y + 62, &s2, gfx::MUTED, 1);
@@ -1122,5 +1163,108 @@ fn page_about_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     let mut up: heapless::String<40> = heapless::String::new();
     let _ = write!(up, "uptime {} s", st.uptime_s);
     c.text(card.x + 552, card.y + 66, &up, gfx::MUTED, 1);
+    d.push(r).ok();
+}
+
+// ---------------------------------------------------------------- USB input
+fn page_usb_static(c: &mut Canvas) {
+    Card::new(8, CONTENT_Y, 480, 240, c, "USB KEYBOARD - US layout");
+    Card::new(496, CONTENT_Y, 296, 240, c, "USB MOUSE");
+    Card::new(8, 336, 784, 132, c, "USB HOST - Type-A port");
+    c.text(
+        20,
+        380,
+        "F1..F6: pages   TAB: next page   LEFT/RIGHT: previous/next file",
+        gfx::TEXT,
+        1,
+    );
+    c.text(
+        20,
+        402,
+        "ENTER: play / confirm deletion   ESC: cancel deletion and stop",
+        gfx::TEXT,
+        1,
+    );
+    c.text(
+        20,
+        424,
+        "Mouse: move cursor and left-click tabs or media controls",
+        gfx::TEXT,
+        1,
+    );
+    c.text(
+        20,
+        446,
+        "Full/low speed hubs; 2 hubs, 8 ports each, 4 HID interfaces",
+        gfx::MUTED,
+        1,
+    );
+}
+fn page_usb_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
+    let s = &st.usb_input;
+    let r = Rect::new(16, CONTENT_Y + 26, 464, 204);
+    c.rect(r.x, r.y, r.w, r.h, gfx::PANEL);
+    let mut line: heapless::String<72> = heapless::String::new();
+    let _ = write!(
+        line,
+        "{} keyboard(s)  modifiers {:02X}  key {:02X}",
+        s.keyboards, s.modifiers, s.last_key
+    );
+    c.text(20, 120, &line, gfx::TEXT, 1);
+    c.text(
+        20,
+        150,
+        "Type here (SHIFT, CAPS LOCK, BACKSPACE):",
+        gfx::MUTED,
+        1,
+    );
+    let mut row: heapless::String<72> = heapless::String::new();
+    let mut y = 176;
+    for ch in s.text.chars() {
+        if ch == '\n' || row.len() >= 70 {
+            c.text(20, y, &row, gfx::ACCENT, 1);
+            row.clear();
+            y += 22;
+            if y > 286 {
+                break;
+            }
+        }
+        if ch != '\n' {
+            let _ = row.push(ch);
+        }
+    }
+    c.text(20, y, &row, gfx::ACCENT, 1);
+    d.push(r).ok();
+    let r = Rect::new(504, CONTENT_Y + 26, 280, 204);
+    c.rect(r.x, r.y, r.w, r.h, gfx::PANEL);
+    line.clear();
+    let _ = write!(line, "{} mouse(s)", s.mice);
+    c.text(508, 120, &line, gfx::TEXT, 1);
+    line.clear();
+    let _ = write!(line, "position {:?}", s.mouse);
+    c.text(508, 146, &line, gfx::TEXT, 1);
+    line.clear();
+    let _ = write!(line, "buttons {:02X}  wheel {}", s.buttons, s.wheel);
+    c.text(508, 172, &line, gfx::TEXT, 1);
+    c.text(508, 204, "1=LEFT  2=RIGHT  4=MIDDLE", gfx::MUTED, 1);
+    line.clear();
+    let _ = write!(line, "reports {}  dropped {}", s.reports, s.dropped);
+    c.text(508, 232, &line, gfx::MUTED, 1);
+    line.clear();
+    let _ = write!(
+        line,
+        "hubs {}  USB {}",
+        s.hubs,
+        if st.usb_connected {
+            "attached"
+        } else {
+            "waiting"
+        }
+    );
+    c.text(508, 260, &line, gfx::SKY, 1);
+    d.push(r).ok();
+    let r = Rect::new(16, 358, 768, 16);
+    c.rect(r.x, r.y, r.w, r.h, gfx::PANEL);
+    c.text(20, 360, &crate::usb::USB_REPORT.read(), gfx::MUTED, 1);
     d.push(r).ok();
 }

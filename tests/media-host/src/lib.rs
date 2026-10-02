@@ -722,3 +722,11 @@ fn lcd_paint_preserves_queued_and_ready_decode_jobs() {
     assert!(result.is_err());
     assert!(worker.idle());
 }
+
+#[cfg(test)]
+#[path="../../../src/usb_input.rs"]
+mod usb_input;
+
+#[cfg(test)]
+#[path="../../../src/usb_hid.rs"]
+mod usb_hid;

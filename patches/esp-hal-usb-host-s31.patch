@@ -1,0 +1,98 @@
+diff --git a/esp-hal/src/usb/otg/embassy_usb_device.rs b/esp-hal/src/usb/otg/embassy_usb_device.rs
+index 30eee205f..fa8f7b99b 100644
+--- a/esp-hal/src/usb/otg/embassy_usb_device.rs
++++ b/esp-hal/src/usb/otg/embassy_usb_device.rs
+@@ -3,14 +3,7 @@
+ use embassy_usb_driver::{EndpointAddress, EndpointAllocError, EndpointType, Event, Unsupported};
+ pub use embassy_usb_synopsys_otg::Config;
+ use embassy_usb_synopsys_otg::{
+-    Bus as OtgBus,
+-    ControlPipe,
+-    Driver as OtgDriver,
+-    Endpoint,
+-    In,
+-    OtgInstance,
+-    Out,
+-    otg_v1::Otg,
++    Bus as OtgBus, ControlPipe, Driver as OtgDriver, Endpoint, In, OtgInstance, Out, otg_v1::Otg,
+ };
+ 
+ use crate::usb::otg::Usb;
+@@ -34,6 +27,7 @@ impl<'d> Driver<'d> {
+             regs: unsafe { Otg::from_ptr(info.register_ptr.cast_mut()) },
+             state: peri.embassy_device_state(),
+             fifo_depth_words: info.fifo_depth_words as u16,
++            tx_fifo_count: 0, // ESP DWC dedicates FIFO n to endpoint n.
+             extra_rx_fifo_words: info.rx_fifo_extra_words,
+             phy_type: info.phy_type,
+             calculate_trdt_fn: |_| 5,
+diff --git a/esp-hal/src/usb/otg/embassy_usb_host.rs b/esp-hal/src/usb/otg/embassy_usb_host.rs
+index d49d1894a..60060230d 100644
+--- a/esp-hal/src/usb/otg/embassy_usb_host.rs
++++ b/esp-hal/src/usb/otg/embassy_usb_host.rs
+@@ -15,6 +15,14 @@ pub struct Driver<'d> {
+ }
+ 
+ impl<'d> Driver<'d> {
++    /// Host operation at full/low speed using the native HS UTMI PHY.
++    /// Intended for HID devices and hubs while HS split transactions are absent.
++    pub fn new_full_speed(peri: Usb<'d>) -> Self {
++        let mut driver = Self::new(peri);
++        driver.inner.set_full_speed_only();
++        driver
++    }
++
+     /// Creates a new host controller driver for embassy-usb-host.
+     pub fn new(peri: Usb<'d>) -> Self {
+         let i = peri.info();
+diff --git a/esp-hal/src/usb/otg/mod.rs b/esp-hal/src/usb/otg/mod.rs
+index 884b9d777..bea8878b7 100644
+--- a/esp-hal/src/usb/otg/mod.rs
++++ b/esp-hal/src/usb/otg/mod.rs
+@@ -41,9 +41,7 @@ let usb = Usb::new_hs(peripherals.USB_HS);
+ )]
+ 
+ use embassy_usb_synopsys_otg::{
+-    PhyType,
+-    State,
+-    StateStorage,
++    PhyType, State, StateStorage,
+     host::{HostState, HostStateStorage, on_host_interrupt},
+     on_interrupt,
+     otg_v1::Otg,
+@@ -131,12 +129,15 @@ impl<'d> USB_FS<'d> {
+     }
+ 
+     fn device_state() -> State<'static> {
+-        static DEVICE: StateStorage<7> = StateStorage::new();
++        static DEVICE: StateStorage<7> =
++            StateStorage::new(embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex::new());
+         DEVICE.as_state()
+     }
+ 
+     fn host_state() -> HostState<'static> {
+-        static HOST: HostStateStorage<8> = HostStateStorage::new();
++        static HOST: HostStateStorage<8> = HostStateStorage::new(
++            embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex::new(),
++        );
+         HOST.as_host_state()
+     }
+ 
+@@ -228,12 +229,15 @@ impl<'d> USB_HS<'d> {
+     }
+ 
+     fn device_state() -> State<'static> {
+-        static DEVICE: StateStorage<16> = StateStorage::new();
++        static DEVICE: StateStorage<16> =
++            StateStorage::new(embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex::new());
+         DEVICE.as_state()
+     }
+ 
+     fn host_state() -> HostState<'static> {
+-        static HOST: HostStateStorage<16> = HostStateStorage::new();
++        static HOST: HostStateStorage<16> = HostStateStorage::new(
++            embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex::new(),
++        );
+         HOST.as_host_state()
+     }
+ 

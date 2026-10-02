@@ -23,7 +23,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + `embedded-sdmmc` | **works** on the 128 GB FAT32 card: file playback, new numbered WAV recordings, and read-only boot inspection |
 | WS2812 status LED | GPIO37 | `esp_hal::rmt` | **disabled at user request** — black latched once at startup; no animation or button feedback |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
-| USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
+| USB hub / keyboard / mouse | Type-A, native USB_HS PHY | Rust Embassy USB host, FS/LS bus | **implemented; peripheral testing pending** — USB page, typing, mouse cursor/clicks, hub hotplug; see [USB host](doc/17-usb-host-input.md) |
 | DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: paged SCCB + DVP RX, Rust JPEG and AVI | live 320x240 preview and MJPEG + stereo microphone AVI recording; on-board AVI playback; SD file also decoded on host |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
 | Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: JPEG + USB tasks |
@@ -32,10 +32,12 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 ## Console
 
 - **USB-C (FT232R)**: boot log + heartbeat, 115200 8N1.
-- **Type-A (USB HS)**: CDC-ACM port (e.g. `/dev/ttyACM0`), connect with any
-  terminal. Type text - it echoes in upper case. Send `?` for a status line.
+- **Type-A**: USB host by default; attach a hub, keyboard and mouse. The optional
+  `usb-device` build retains the earlier CDC implementation.
 
 ## Controls
+
+USB keyboard and mouse shortcuts are described in [USB host input](doc/17-usb-host-input.md).
 
 - The title stays at the top; startup no longer asks for display-phase calibration.
 - **Touch** the tabs to switch pages (HOME / AUDIO / SD CARD / CAMERA / ABOUT).
@@ -116,7 +118,11 @@ src/
 ├── touch.rs     — GT1151 polling driver
 ├── sdcard.rs    — SDMMC host + sdio card stack + read-only FAT16/32/exFAT detector
 ├── camera.rs    — DVP sensor SCCB probe
-├── usb.rs       — embassy-usb CDC-ACM task (runs on core 1)
+├── usb.rs       — USB role selection and synchronized input/status
+├── usb_host.rs  — USB hub/HID host tasks on core 1
+├── usb_hid.rs   — report descriptor decoding
+├── usb_input.rs — key/click edges, mouse position and bounded text field
+├── usb_device.rs — optional legacy CDC task
 ├── buttons.rs   — ADC ladder decode (blocked, see above)
 └── led.rs       — WS2812 via RMT
 ```
@@ -138,7 +144,8 @@ rustup target add riscv32imafc-unknown-none-elf
 
 # The esp-rs crates point at a local checkout of esp-hal @ 0e9fe8d with the
 # branch `s31-adc-clock-patch` checked out (see Cargo.toml path deps).
-cargo run --release          # builds, flashes, and opens the monitor
+scripts/setup-usb-host.sh    # pinned Embassy host + HAL compatibility patches
+cargo run --release          # builds USB host + media, flashes and opens monitor
 ```
 
 The runner flashes `/dev/ttyUSB0` (the board's FT232R port) — adjust

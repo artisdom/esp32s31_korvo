@@ -3,9 +3,9 @@
 //! Drives every peripheral on the board:
 //! 4.3" RGB LCD + GT1151 touch, ES8389 codec (speaker + mics) over I2S,
 //! WS2812 LED (RMT), ADC button ladder, microSD (SDMMC), DVP camera + AVI recorder,
-//! USB 2.0 HS CDC-ACM on the Type-A port, PSRAM heap, dual core.
+//! USB hub/keyboard/mouse host on the Type-A port, PSRAM heap, dual core.
 //!
-//! Core 0: hardware bring-up + UI/event loop. Core 1: JPEG compression + USB device task.
+//! Core 0: hardware bring-up + UI/event loop. Core 1: JPEG compression + USB host task.
 
 #![no_std]
 #![no_main]
@@ -63,6 +63,9 @@ mod touch;
 mod touch_action;
 mod ui;
 mod usb;
+#[cfg(feature = "usb-host")]
+mod usb_hid;
+mod usb_input;
 mod video_player;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -376,6 +379,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         usb_connected: false,
         usb_rx: 0,
         usb_tx: 0,
+        usb_input: usb_input::Input::new().snapshot,
         sd: Some(sd),
         btn_mv: 0,
         btn_held: None,
@@ -482,34 +486,113 @@ async fn main(_spawner: embassy_executor::Spawner) {
             );
             previous_held = st.btn_held;
         }
-        // ---- touch ----
-        // Touch, rendering and dirty regions all use screen coordinates.
-        if let Some(t) = touch.as_mut() {
-            st.touch_point = t.poll().map(|p| (p.x, p.y));
-            if st.touch_point.is_some() && touch_seen < 3 {
-                touch_seen += 1;
-                println!("touch: {:?}", st.touch_point);
-            }
-            if let Some((x, y)) = touch_action.update(st.touch_point, start.elapsed().as_millis()) {
-                if let Some(page) = ui::hit_tabs(x, y) {
-                    media.delete_request.cancel();
-                    st.page = page;
-                } else if matches!(st.page, Page::Audio | Page::Storage | Page::Camera) {
-                    if let Some(cmd) =
-                        ui::hit_media(st.page, x, y, media.delete_request.name().is_some())
-                    {
-                        if matches!(cmd, media::Command::PlayFile) {
-                            st.page = if media.selected_file_video() {
-                                Page::Camera
-                            } else {
-                                Page::Audio
-                            };
+        // USB events are queued by core 1; media and display stay owned by core 0.
+        while let Some(event) = usb::INPUT.lock(|i| i.borrow_mut().pop()) {
+            let mut cmd = None;
+            match event {
+                usb_input::Event::Key(key) => {
+                    println!("usb input: key={:02x}", key);
+                    match key {
+                        0x3a..=0x3f => {
+                            media.delete_request.cancel();
+                            st.page = ui::PAGES[(key - 0x3a) as usize].0;
                         }
-                        media.command(cmd, &mut audio);
+                        0x2b => {
+                            media.delete_request.cancel();
+                            st.page = st.page.next();
+                        }
+                        0x29 => {
+                            media.delete_request.cancel();
+                            cmd = Some(media::Command::Stop);
+                        }
+                        0x4f | 0x50
+                            if matches!(st.page, Page::Audio | Page::Storage | Page::Camera) =>
+                        {
+                            let next = key == 0x4f;
+                            cmd = Some(match st.page {
+                                Page::Storage => {
+                                    if next {
+                                        media::Command::FileNext
+                                    } else {
+                                        media::Command::FilePrevious
+                                    }
+                                }
+                                Page::Camera => {
+                                    if next {
+                                        media::Command::VideoNext
+                                    } else {
+                                        media::Command::VideoPrevious
+                                    }
+                                }
+                                _ => {
+                                    if next {
+                                        media::Command::Next
+                                    } else {
+                                        media::Command::Previous
+                                    }
+                                }
+                            });
+                        }
+                        0x28 if media.delete_request.name().is_some() => {
+                            cmd = Some(media::Command::ConfirmDelete)
+                        }
+                        0x28 if matches!(st.page, Page::Audio | Page::Storage | Page::Camera) => {
+                            cmd = Some(match st.page {
+                                Page::Storage => media::Command::PlayFile,
+                                Page::Camera => media::Command::VideoPlay,
+                                _ => media::Command::Play,
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+                usb_input::Event::Click(x, y) => {
+                    println!("usb input: click {},{}", x, y);
+                    if let Some(page) = ui::hit_tabs(x, y) {
+                        media.delete_request.cancel();
+                        st.page = page;
+                    } else if matches!(st.page, Page::Audio | Page::Storage | Page::Camera) {
+                        cmd = ui::hit_media(st.page, x, y, media.delete_request.name().is_some());
                     }
                 }
             }
+            if let Some(cmd) = cmd {
+                if matches!(cmd, media::Command::PlayFile) {
+                    st.page = if media.selected_file_video() {
+                        Page::Camera
+                    } else {
+                        Page::Audio
+                    };
+                }
+                media.command(cmd, &mut audio);
+            }
         }
+        st.usb_input = usb::INPUT.lock(|i| i.borrow().snapshot.clone());
+        // Physical touch retains its own press/release latch. Mouse clicks are edges above.
+        let physical_touch = touch.as_mut().and_then(|t| t.poll()).map(|p| (p.x, p.y));
+        if physical_touch.is_some() && touch_seen < 3 {
+            touch_seen += 1;
+            println!("touch: {:?}", physical_touch);
+        }
+        if let Some((x, y)) = touch_action.update(physical_touch, start.elapsed().as_millis()) {
+            if let Some(page) = ui::hit_tabs(x, y) {
+                media.delete_request.cancel();
+                st.page = page;
+            } else if matches!(st.page, Page::Audio | Page::Storage | Page::Camera)
+                && let Some(cmd) =
+                    ui::hit_media(st.page, x, y, media.delete_request.name().is_some())
+            {
+                if matches!(cmd, media::Command::PlayFile) {
+                    st.page = if media.selected_file_video() {
+                        Page::Camera
+                    } else {
+                        Page::Audio
+                    };
+                }
+                media.command(cmd, &mut audio);
+            }
+        }
+        st.touch_point = physical_touch.or(st.usb_input.mouse);
 
         // ---- audio streaming + SD playback / recording ----
         // Keep clocks and microphone capture running, but shut down the
@@ -585,6 +668,8 @@ async fn main(_spawner: embassy_executor::Spawner) {
         // the dynamic widgets and cache-clean those regions (a full-frame
         // clean every tick starves the LCD DMA and the panel rolls).
         if decoder.paint(|| {
+            let cursor = ui::cursor(&mut display.canvas(), None);
+            display.flush_rects(cursor.as_slice());
             if shown_page != st.page {
                 shown_page = st.page;
                 ui::draw(&mut display.canvas(), &st);
@@ -610,6 +695,8 @@ async fn main(_spawner: embassy_executor::Spawner) {
                     display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
                 }
             }
+            let cursor = ui::cursor(&mut display.canvas(), st.touch_point);
+            display.flush_rects(cursor.as_slice());
         }) {
             media.frame_presented();
         }

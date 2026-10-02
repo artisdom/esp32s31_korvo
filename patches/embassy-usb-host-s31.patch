@@ -1,0 +1,300 @@
+diff --git a/embassy-usb-host/Cargo.toml b/embassy-usb-host/Cargo.toml
+index 91ad575..a09aa30 100644
+--- a/embassy-usb-host/Cargo.toml
++++ b/embassy-usb-host/Cargo.toml
+@@ -22,7 +22,7 @@ features = ["defmt"]
+ embassy-usb = { version = "0.6.0", path = "../embassy-usb", default-features = false }
+ embassy-usb-driver = { version = "0.2.2", path = "../embassy-usb-driver" }
+ embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+-embassy-time = { version = "0.5.1", path = "../embassy-time" }
++embassy-time = { version = "0.5.1" }
+ embedded-io-async = "0.7.0"
+ aligned = "0.4"
+ bitflags = "2.11.0"
+@@ -37,7 +37,7 @@ block-device-driver = { version = "0.2.0", optional = true }
+ env_logger = "0.11"
+ # Enable critical-section implementation for std, for tests
+ critical-section = { version = "1.1", features = ["std"] }
+-embassy-time = { version = "0.5.1", path = "../embassy-time", features = ["mock-driver", "generic-queue-8"] }
++embassy-time = { version = "0.5.1", features = ["mock-driver", "generic-queue-8"] }
+ 
+ [features]
+ defmt = ["dep:defmt", "embassy-usb-driver/defmt", "heapless/defmt"]
+diff --git a/embassy-usb-host/src/class/hid.rs b/embassy-usb-host/src/class/hid.rs
+index 8ca4ac2..89a7ae0 100644
+--- a/embassy-usb-host/src/class/hid.rs
++++ b/embassy-usb-host/src/class/hid.rs
+@@ -249,7 +249,11 @@ impl<'d, A: UsbHostAllocator<'d>> HidHost<'d, A> {
+     /// then allocates the necessary channels.
+     pub fn new(alloc: &A, config_desc: &[u8], enum_info: &EnumerationInfo) -> Result<Self, HidError> {
+         let info = find_hid(config_desc).ok_or(HidError::NoInterface)?;
++        Self::new_with_info(alloc, &info, enum_info)
++    }
+ 
++    /// Create a driver for one selected HID interface in a composite device.
++    pub fn new_with_info(alloc: &A, info: &HidInfo, enum_info: &EnumerationInfo) -> Result<Self, HidError> {
+         let ctrl_ep_info = EndpointInfo {
+             addr: EndpointAddress::from_parts(0, UsbDirection::In),
+             ep_type: EndpointType::Control,
+diff --git a/embassy-usb-host/src/class/hub.rs b/embassy-usb-host/src/class/hub.rs
+index 090f5e1..77a88aa 100644
+--- a/embassy-usb-host/src/class/hub.rs
++++ b/embassy-usb-host/src/class/hub.rs
+@@ -28,6 +28,10 @@ const PORT_ENABLE_POLLS: u32 = 10;
+ /// Milliseconds between those polls.
+ const PORT_ENABLE_POLL_MS: u64 = 10;
+ 
++fn slice_len(ports: u8) -> usize {
++    ports as usize / 8 + 1
++}
++
+ pub struct HubHandler<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> {
+     bus: BusHandle<'d, A>,
+     interrupt_channel: A::Pipe<pipe::Interrupt, pipe::In>,
+@@ -36,6 +40,7 @@ pub struct HubHandler<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> {
+     device_address: u8,
+     device_lut: [Option<NonZeroU8>; MAX_PORTS],
+     route: BusRoute,
++    pending_changes: [u8; 32],
+ }
+ 
+ #[derive(Debug)]
+@@ -123,6 +128,7 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
+             device_address: enum_info.device_address,
+             device_lut: [None; MAX_PORTS],
+             route: enum_info.route,
++            pending_changes: [0; 32],
+         };
+ 
+         for port in 0..hub.desc.port_num {
+@@ -137,12 +143,15 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
+     pub async fn wait_for_event(&mut self) -> Result<HandlerEvent<HubEvent>, HostError> {
+         loop {
+             // 1 hub + maximum of 255 ports (USB 2.0 Spec 11.12.3 and 11.23.2.1)
+-            let mut buf = [0u8; (1 + 255) / u8::BITS as usize];
++            let mut buf = self.pending_changes;
+             let slice = &mut buf[..(self.desc.port_num as usize / 8) + 1];
+-            self.interrupt_channel.request_in(slice).await?;
++            if slice.iter().all(|b| *b == 0) {
++                self.interrupt_channel.request_in(slice).await?;
++            }
+ 
+             let mut hub_changes = HubInterrupt(slice);
+             if hub_changes.take_hub_change() {
++                self.pending_changes[..slice_len(self.desc.port_num)].copy_from_slice(hub_changes.0);
+                 trace!("HUB {}: hub changed, requesting status", self.device_address);
+ 
+                 let (status, mut change) = self.get_hub_status().await?;
+@@ -167,6 +176,7 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
+                 }
+             }
+             while let Some(port) = hub_changes.take_port_change() {
++                self.pending_changes[..slice_len(self.desc.port_num)].copy_from_slice(hub_changes.0);
+                 trace!("HUB {}: port {} changed, requesting status", self.device_address, port);
+ 
+                 let (status, mut change) = self.get_port_status(port).await?;
+diff --git a/embassy-usb-synopsys-otg/Cargo.toml b/embassy-usb-synopsys-otg/Cargo.toml
+index 820720d..882e40e 100644
+--- a/embassy-usb-synopsys-otg/Cargo.toml
++++ b/embassy-usb-synopsys-otg/Cargo.toml
+@@ -38,7 +38,7 @@ portable-atomic = { version = "1" }
+ document-features = "0.2.7"
+ 
+ embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+-embassy-time = { version = "0.5.1", path = "../embassy-time", optional = true }
++embassy-time = { version = "0.5.1", optional = true }
+ embassy-usb-driver = { version = "0.2.2", path = "../embassy-usb-driver" }
+ 
+ defmt = { version = "1.0.1", optional = true }
+diff --git a/embassy-usb-synopsys-otg/src/host.rs b/embassy-usb-synopsys-otg/src/host.rs
+index f7e00de..032ca18 100644
+--- a/embassy-usb-synopsys-otg/src/host.rs
++++ b/embassy-usb-synopsys-otg/src/host.rs
+@@ -438,6 +438,7 @@ where
+ {
+     instance: OtgHostInstance<'d, M>,
+     inited: bool,
++    full_speed_only: bool,
+ }
+ 
+ impl<'d, M> OtgHost<'d, M>
+@@ -449,9 +450,16 @@ where
+         Self {
+             instance,
+             inited: false,
++            full_speed_only: false,
+         }
+     }
+ 
++    /// Restrict an HS-capable PHY to a full/low-speed host bus.
++    /// Keeps UTMI selected and avoids unsupported HS transaction translators.
++    pub fn set_full_speed_only(&mut self) {
++        self.full_speed_only = true;
++    }
++
+     async fn configure_as_host(&self) {
+         let r = self.instance.regs;
+         let phy_type = self.instance.phy_type;
+@@ -497,6 +505,10 @@ where
+             w.set_fdmod(false);
+             // Enable internal full-speed PHY
+             w.set_physel(phy_type.internal() && !phy_type.high_speed());
++            if phy_type == PhyType::InternalHighSpeed {
++                w.set_ulpi_utmi_sel(false);
++                w.set_phyif(r.hwcfg4().read().utmi_phy_data_width() == 1);
++            }
+         });
+ 
+         // Wait for host mode to take effect (~25ms).
+@@ -519,6 +531,7 @@ where
+         // fslspcs=0: 30/60 MHz (HS PHY); fslspcs=1: 48 MHz (FS PHY).
+         r.hcfg().modify(|w| {
+             w.set_fslspcs(if self.instance.phy_type.high_speed() { 0 } else { 1 });
++            w.set_fslss(self.full_speed_only);
+         });
+ 
+         // Configure FIFO sizes for host mode:
+@@ -659,6 +672,7 @@ where
+                     ep_number,
+                     max_packet_size,
+                     is_low_speed,
++                    preamble: split.is_some() && speed_code != 2 && is_low_speed,
+                     data_toggle: false,
+                     phantom: PhantomData,
+                 });
+@@ -735,6 +749,9 @@ where
+                 return DeviceEvent::Disconnected;
+             }
+ 
++            if event == PORT_EVENT_OVERCURRENT {
++                return DeviceEvent::Overcurrent;
++            }
+             // Connected: perform bus reset.
+             self.bus_reset().await;
+ 
+@@ -792,7 +809,12 @@ where
+                         Speed::Full | Speed::Low => {
+                             // Both FS and LS use 1 ms frame intervals.
+                             // PHY clock: HS PHY = 60 MHz, FS PHY = 48 MHz.
+-                            let frivl = if phy_type.high_speed() { 60_000 } else { 48_000 };
++                            let frivl = if phy_type.high_speed() {
++                                // UTMI 16-bit mode clocks at 30 MHz; 8-bit mode at 60 MHz.
++                                if r.gusbcfg().read().phyif() { 30_000 } else { 60_000 }
++                            } else {
++                                48_000
++                            };
+                             r.hfir().write(|w| w.set_frivl(frivl));
+                         }
+                         Speed::High => {} // Keep HS defaults
+@@ -874,6 +896,32 @@ where
+     }
+ }
+ 
++/// On cancellation, revoke the ISR buffer pointer before its borrow ends.
++struct RxGuard<'d, M: RawMutex + Copy> {
++    regs: Otg,
++    state: HostState<'d, M>,
++    index: usize,
++}
++impl<M: RawMutex + Copy> Drop for RxGuard<'_, M> {
++    fn drop(&mut self) {
++        self.state.mutex.lock(|| {
++            let ch = &self.state.channels[self.index];
++            // Request a halt without unbounded spinning inside a critical section.
++            if self.regs.hcchar(self.index).read().chena() {
++                self.regs.hcchar(self.index).modify(|w| {
++                    w.set_chdis(true);
++                    w.set_chena(true);
++                });
++            }
++            unsafe {
++                *ch.rx_buffer.get() = core::ptr::null_mut();
++                *ch.rx_count.get() = 0;
++                *ch.rx_capacity.get() = 0;
++            }
++        });
++    }
++}
++
+ /// A USB host channel for performing transfers.
+ ///
+ /// The channel is automatically released when dropped.
+@@ -890,6 +938,7 @@ where
+     ep_number: u8,
+     max_packet_size: u16,
+     is_low_speed: bool,
++    preamble: bool,
+     data_toggle: bool,
+     phantom: PhantomData<(T, D)>,
+ }
+@@ -1096,15 +1145,6 @@ where
+         }
+     }
+ 
+-    fn clear_rx_buffer(&self) {
+-        let ch_state = &self.state.channels[self.index];
+-        unsafe {
+-            *ch_state.rx_buffer.get() = core::ptr::null_mut();
+-            *ch_state.rx_count.get() = 0;
+-            *ch_state.rx_capacity.get() = 0;
+-        }
+-    }
+-
+     fn rx_count(&self) -> usize {
+         unsafe { *self.state.channels[self.index].rx_count.get() }
+     }
+@@ -1178,7 +1218,12 @@ where
+ 
+             let events = self.wait_for_result().await;
+             match Self::classify_events(events) {
+-                ChannelEvent::Complete => return Ok(()),
++                ChannelEvent::Complete => {
++                    if self.preamble {
++                        embassy_time::Timer::after_millis(1).await;
++                    }
++                    return Ok(());
++                }
+                 ChannelEvent::Nyet => {
+                     do_ping = true;
+                     yield_now().await;
+@@ -1218,15 +1263,25 @@ where
+ 
+         loop {
+             self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
++            let guard = RxGuard {
++                regs: self.regs,
++                state: self.state,
++                index: self.index,
++            };
+             self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
+             self.enable_channel();
+ 
+             let events = self.wait_for_result().await;
+             let count = self.rx_count();
+-            self.clear_rx_buffer();
++            drop(guard);
+ 
+             match Self::classify_events(events) {
+-                ChannelEvent::Complete => return Ok(count),
++                ChannelEvent::Complete => {
++                    if self.preamble {
++                        embassy_time::Timer::after_millis(1).await;
++                    }
++                    return Ok(count);
++                }
+                 ChannelEvent::Nak | ChannelEvent::Nyet | ChannelEvent::Halted | ChannelEvent::None => {
+                     // Periodic channels auto-halt after NAK; settle before retry.
+                     if is_periodic {
+diff --git a/embassy-usb/Cargo.toml b/embassy-usb/Cargo.toml
+index e698673..d32d3ff 100644
+--- a/embassy-usb/Cargo.toml
++++ b/embassy-usb/Cargo.toml
+@@ -62,7 +62,7 @@ embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
+ embassy-usb-driver = { version = "0.2.2", path = "../embassy-usb-driver" }
+ embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+ embassy-net-driver-channel = { version = "0.4.0", path = "../embassy-net-driver-channel" }
+-embassy-time = { version = "0.5.1", path = "../embassy-time" }
++embassy-time = { version = "0.5.1" }
+ 
+ defmt = { version = "1", optional = true }
+ log = { version = "0.4.14", optional = true }

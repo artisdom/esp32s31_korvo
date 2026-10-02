@@ -20,6 +20,25 @@ impl Console {
                     continue;
                 }
                 let cmd = match self.line.as_str() {
+                    "usb" => {
+                        let s = crate::usb::INPUT.lock(|i| i.borrow().snapshot.clone());
+                        esp_println::println!(
+                            "usb status: hubs={} keyboards={} mice={} reports={} modifiers={:02x} last_key={:02x} mouse={:?} buttons={:02x} wheel={} dropped={} text={:?}",
+                            s.hubs,
+                            s.keyboards,
+                            s.mice,
+                            s.reports,
+                            s.modifiers,
+                            s.last_key,
+                            s.mouse,
+                            s.buttons,
+                            s.wheel,
+                            s.dropped,
+                            s.text.as_str()
+                        );
+                        esp_println::println!("usb status: {}", crate::usb::USB_REPORT.read());
+                        None
+                    }
                     "play" => Some(Command::Play),
                     "stop" => Some(Command::Stop),
                     "next" => Some(Command::Next),
@@ -45,9 +64,9 @@ impl Console {
                     _ => None,
                 };
                 esp_println::println!("console: {}", self.line);
-                if cmd.is_none() {
+                if cmd.is_none() && self.line.as_str() != "usb" {
                     esp_println::println!(
-                        "commands: play stop next prev record replay video video-play video-replay video-next video-prev file-play rescan demo tone mic
+                        "commands: usb play stop next prev record replay video video-play video-replay video-next video-prev file-play rescan demo tone mic
                          delete delete-file confirm-delete cancel-delete file-next file-prev"
                     );
                 }

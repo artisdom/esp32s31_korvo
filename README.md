@@ -19,14 +19,14 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | RGB LCD 800x480 | 16-bit bus, 18 MHz PCLK (35 Hz), framebuffer in PSRAM | `esp_hal::lcd_cam::lcd::dpi` + custom descriptor-ring DMA buffer | **works** — RGB transfer buffer enabled; horizontal drift stopped in the 2026-10-02 board check, with zero reported underruns during live updates |
 | Capacitive touch | GT1151 @ I2C 0x14 | this repo (`touch.rs`, 16-bit regs, checksummed reports) | **works** — polled, drives page navigation + cursor |
 | Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | SD MP3 and PCM WAV playback implemented; DMA completion verified on this board, audible chime confirmed |
-| Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | shared-clock I2S rings + RMS meter + FAT WAV recorder | sustained 48 kHz stereo recording and reopening verified; speech quality check pending |
+| Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | shared-clock I2S rings + RMS meter + FAT WAV recorder | 48 kHz stereo WAV recording; clean new recording playback confirmed by user |
 | microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + `embedded-sdmmc` | **works** on the 128 GB FAT32 card: file playback, new numbered WAV recordings, and read-only boot inspection |
 | WS2812 status LED | GPIO37 | `esp_hal::rmt` | **disabled at user request** — black latched once at startup; no animation or button feedback |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
 | USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
-| DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: 20 MHz XCLK from LCD_CAM + paged SCCB | **detected** — PID 0xda4a; capture is future work |
+| DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: paged SCCB + DVP RX, Rust JPEG and AVI | live 320x240 preview and MJPEG + stereo microphone AVI recording; SD file decoded on host |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
-| Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: USB task |
+| Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: JPEG + USB tasks |
 | Wi-Fi 6 / BT 5.4 / 802.15.4 | modem | `esp-radio` | **not in this demo** — esp-radio support for the S31 is unreleased/experimental upstream |
 
 ## Console
@@ -40,7 +40,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 - The title stays at the top; startup no longer asks for display-phase calibration.
 - **Touch** the tabs to switch pages (HOME / AUDIO / SD CARD / CAMERA / ABOUT).
 - **MODE** cycles pages.
-- On **AUDIO**, **SET** starts recording or saves the active recording. On other pages, SET stops media and plays the test chime.
+- On **AUDIO**, **SET** starts recording or saves the active recording. On **CAMERA**, SET starts or saves video with microphone audio. On remaining pages, SET stops media and plays the test chime.
 - **AUDIO** controls: PREVIOUS / NEXT select a track; PLAY starts it; STOP ends playback or saves a recording; RECORD / SAVE toggles recording; REPLAY LAST plays the latest saved recording; RESCAN SD refreshes the list.
 - The LED stays off. Speaker audio starts silent, with default volume **-30 dB**.
 - **VOL+ / VOL-** change the ES8389 DAC volume in 3 dB steps.
@@ -86,9 +86,12 @@ The onboard camera answers SCCB once the SoC drives its master clock:
    byte (`sc101iot_read_a16v8` in the vendor driver).
 
 With that in place the board reports **SC101IOT, PID 0xda4a** (OV3660 is not
-populated on this unit). Live capture still needs a port of the vendor's
-~190-entry init table plus DVP DMA reception and YUV→RGB565 conversion; the
-esp-hal `lcd_cam::cam` DVP driver is available for it.
+populated on this unit). CAMERA now offers a 320x240 live preview and records
+MJPEG video plus 48 kHz stereo microphone audio together in numbered AVI files.
+Tap RECORD / SAVE or press SET; STOP saves before card removal. AVI files can
+be deleted in SD CARD and played on a computer. See
+[camera video recording](doc/15-camera-video-recording.md) for controls,
+implementation, validation and limits.
 
 ## Layout
 
@@ -106,7 +109,7 @@ src/
 │                  slave mode, SCLK-derived clocks, 48 kHz coeff table)
 ├── audio.rs     — shared-clock I2S0 TX+RX, synth and microphone meter
 ├── audio_ring.rs — continuous DMA rings and completed-descriptor polling
-├── media.rs     — MP3/WAV playback and numbered WAV recording
+├── media.rs     — MP3/WAV playback, WAV recording and video/audio AVI muxing
 ├── storage.rs   — writable FAT adapter over native SDMMC
 ├── pcm.rs       — WAV format and streaming sample-rate conversion
 ├── touch.rs     — GT1151 polling driver

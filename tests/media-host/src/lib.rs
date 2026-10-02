@@ -1,3 +1,9 @@
+#[path = "../../../src/psram_buffer.rs"]
+mod psram_buffer;
+#[path = "../../../src/jpeg_worker.rs"]
+mod jpeg_worker;
+#[path = "../../../src/avi.rs"]
+mod avi;
 #[path = "../../../src/delete_request.rs"]
 mod delete_request;
 #[path = "../../../src/fat_layout.rs"]
@@ -268,6 +274,75 @@ mod integration {
         }
     }
     #[test]
+    fn avi_video_and_pcm_audio_decode_with_matching_durations() {
+        let path = std::env::temp_dir().join(format!("korvo-avi-{}.avi", std::process::id()));
+        let frames = 5;
+        let mut image = vec![0;avi::FRAME_BYTES];
+        for pair in image.chunks_exact_mut(4) { pair.copy_from_slice(&[128,16,128,235]); }
+        assert_eq!(avi::rgb565(&image,0,0),0);
+        assert_eq!(avi::rgb565(&image,1,0),0xffff);
+        let mut jpeg = Vec::new();
+        avi::encode_jpeg(&image,&mut vec![0;avi::WIDTH*avi::HEIGHT*3],&mut jpeg).unwrap();
+        assert!(jpeg.starts_with(&[0xff,0xd8]) && jpeg.ends_with(&[0xff,0xd9]));
+        // Exercise odd-sized compressed chunks, even when the encoder happens
+        // to generate an even-sized JPEG. Decoders accept trailing zero bytes.
+        if jpeg.len() & 1 == 0 { jpeg.push(0); }
+        let movi_bytes = frames*(jpeg.len() as u32 + 1 + 8 + 38400 + 8);
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&avi::header(avi::HEADER_BYTES as u32+movi_bytes,frames,192000,movi_bytes)).unwrap();
+        for _ in 0..frames {
+            f.write_all(&avi::chunk_header(true,jpeg.len() as u32)).unwrap(); f.write_all(&jpeg).unwrap(); f.write_all(&[0]).unwrap();
+            f.write_all(&avi::chunk_header(false,38400)).unwrap(); f.write_all(&vec![0;38400]).unwrap();
+        }
+        drop(f);
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_name,codec_tag_string,width,height,sample_rate,channels,duration",
+                "-of",
+                "compact",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        let info = String::from_utf8(probe.stdout).unwrap();
+        assert!(
+            info.contains("codec_name=mjpeg") && info.contains("codec_tag_string=MJPG"),
+            "{}",
+            info
+        );
+        assert!(info.contains("width=320|height=240"), "{}", info);
+        assert!(
+            info.contains("codec_name=pcm_s16le") && info.contains("sample_rate=48000|channels=2"),
+            "{}",
+            info
+        );
+        assert!(info.contains("duration=1.000000"), "{}", info);
+        let audio = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-map", "0:a:0", "-f", "s16le", "-"])
+            .output()
+            .unwrap();
+        assert!(audio.status.success());
+        assert_eq!(audio.stdout.len(), 192000);
+        let decode = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            decode.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decode.stderr)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn mp3_fixture_decodes_and_resamples_to_48khz_stereo() {
         let mut data = include_bytes!("../../fixtures/demo.mp3").as_slice();
         let mut d = nanomp3_core::Decoder::new();
@@ -295,4 +370,37 @@ mod integration {
         assert!(nonzero > 44100);
         assert_eq!(bytes / 4, (frames as u64 * 48000 / 44100) as usize);
     }
+}
+
+#[test]
+fn jpeg_mailbox_owns_buffers_across_threads_and_preserves_generation() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let worker = Arc::new(jpeg_worker::Worker::new());
+    let done = Arc::new(AtomicBool::new(false));
+    let encoding = worker.clone();
+    let stop = done.clone();
+    let encoder = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) { encoding.encode(); std::thread::yield_now(); }
+    });
+    let frame = [128, 16, 128, 235].repeat(avi::FRAME_BYTES / 4);
+    assert!(!worker.submit(&frame[..frame.len()-1], 999));
+    assert!(worker.take().is_none());
+    for generation in 1..=8 {
+        assert!(worker.submit(&frame, generation));
+        assert!(!worker.submit(&frame, 999));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some((id, jpeg)) = worker.take() {
+                assert_eq!(id, generation);
+                let jpeg = jpeg.unwrap();
+                assert_eq!(&jpeg[..2], &[255,216]);
+                assert_eq!(&jpeg[jpeg.len()-2..], &[255,217]);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    done.store(true, Ordering::Release);
+    encoder.join().unwrap();
 }

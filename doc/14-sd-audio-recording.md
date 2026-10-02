@@ -177,3 +177,6 @@ confirmation without a pending request, deleted only the newly created test
 file, refreshed the browser and invalidated REPLAY LAST. Existing recordings
 and demo files were preserved. LCD underruns and microphone overruns stayed
 zero throughout. Touch-screen confirmation in both tabs remains pending.
+
+Camera video and microphone audio can also be recorded together in numbered
+AVI files. See [camera video recording](15-camera-video-recording.md).

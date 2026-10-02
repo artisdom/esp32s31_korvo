@@ -27,6 +27,7 @@ pub enum Command {
     DeleteFile,
     ConfirmDelete,
     CancelDelete,
+    VideoRecord,
 }
 pub struct Media {
     storage: Option<Storage>,
@@ -47,6 +48,12 @@ pub struct Media {
     output_pos: usize,
     pub seconds: u32,
     record_failed: bool,
+    video: Option<VideoRecorder>,
+    pub camera_ready: bool,
+    encoder: &'static crate::jpeg_worker::Worker,
+    generation: u32,
+    pub video_name: Name,
+    pub video_frames: u32,
 }
 struct Player {
     file: RawFile,
@@ -58,6 +65,19 @@ struct Player {
     played_bytes: u64,
     decoded_any: bool,
 }
+struct VideoRecorder {
+    file: RawFile,
+    name: Name,
+    audio_bytes: u32,
+    frames: u32,
+    movi_bytes: u32,
+    pending: usize,
+    audio: Box<[u8]>,
+    generation: u32,
+    submitted: bool,
+    jpeg: alloc::vec::Vec<u8>,
+    failed: bool,
+}
 struct Recorder {
     file: RawFile,
     name: Name,
@@ -66,7 +86,7 @@ struct Recorder {
     buffer: Box<[u8]>,
 }
 impl Media {
-    pub fn new(storage: Option<Storage>) -> Self {
+    pub fn new(storage: Option<Storage>, encoder: &'static crate::jpeg_worker::Worker) -> Self {
         let mut m = Self {
             storage,
             tracks: heapless::Vec::new(),
@@ -86,6 +106,12 @@ impl Media {
             output_pos: 0,
             seconds: 0,
             record_failed: false,
+            video: None,
+            camera_ready: false,
+            encoder,
+            generation: 0,
+            video_name: Name::new(),
+            video_frames: 0,
         };
         m.refresh();
         m
@@ -102,7 +128,10 @@ impl Media {
             .unwrap_or("No MP3/WAV files in SD root")
     }
     pub fn recording(&self) -> bool {
-        self.recorder.is_some()
+        self.recorder.is_some() || self.video.is_some()
+    }
+    pub fn video_recording(&self) -> bool {
+        self.video.is_some()
     }
     fn refresh(&mut self) {
         match self.storage.as_ref().map(|s| s.files()) {
@@ -128,10 +157,21 @@ impl Media {
             self.delete_request.cancel();
         }
         match cmd {
+            Command::VideoRecord => {
+                if self.video.is_some() {
+                    self.stop(audio);
+                } else if !self.camera_ready {
+                    self.message("Camera not ready - open CAMERA preview");
+                } else {
+                    self.stop(audio);
+                    if let Err(e) = self.start_video() {
+                        self.message(e);
+                    }
+                }
+            }
             Command::DeleteTrack | Command::DeleteFile => {
-                let busy = self.player.is_some()
-                    || self.recorder.is_some()
-                    || audio.source() != Source::Silence;
+                let busy =
+                    self.player.is_some() || self.recording() || audio.source() != Source::Silence;
                 if busy {
                     self.message("STOP playback / recording before deleting");
                     return;
@@ -150,9 +190,8 @@ impl Media {
                 }
             }
             Command::ConfirmDelete => {
-                let busy = self.player.is_some()
-                    || self.recorder.is_some()
-                    || audio.source() != Source::Silence;
+                let busy =
+                    self.player.is_some() || self.recording() || audio.source() != Source::Silence;
                 if let Some(name) = self.delete_request.confirm(busy) {
                     let result = self
                         .storage
@@ -239,10 +278,200 @@ impl Media {
                 }
             }
             Command::Refresh => {
-                if self.player.is_none() && self.recorder.is_none() {
+                if self.player.is_none() && !self.recording() {
                     self.refresh();
                 }
             }
+        }
+    }
+    fn start_video(&mut self) -> Result<(), &'static str> {
+        let s = self.storage.as_ref().ok_or("No writable SD")?;
+        let (file, name) = s.create_video()?;
+        if s.fs
+            .write(
+                file,
+                &crate::avi::header(crate::avi::HEADER_BYTES as u32, 0, 0, 0),
+            )
+            .is_err()
+        {
+            let _ = s.fs.close_file(file);
+            return Err("AVI header write failed");
+        }
+        self.video_name = name.clone();
+        self.video_frames = 0;
+        self.generation = self.generation.wrapping_add(1);
+        self.video = Some(VideoRecorder {
+            file,
+            name,
+            audio_bytes: 0,
+            frames: 0,
+            movi_bytes: 0,
+            pending: 0,
+            audio: vec![0; 8192].into_boxed_slice(),
+            generation: self.generation,
+            submitted: false,
+            jpeg: alloc::vec::Vec::new(),
+            failed: false,
+        });
+        self.message("Recording video + microphone - STOP saves AVI");
+        esp_println::println!("video record: {}", self.video_name);
+        Ok(())
+    }
+    fn flush_video_audio(&mut self) -> Result<(), &'static str> {
+        let v = self.video.as_mut().ok_or("No video recording")?;
+        if v.pending == 0 {
+            return Ok(());
+        }
+        let s = self.storage.as_ref().ok_or("No SD")?;
+        s.fs.write(v.file, &crate::avi::chunk_header(false, v.pending as u32))
+            .map_err(|_| "AVI audio header failed")?;
+        s.fs.write(v.file, &v.audio[..v.pending])
+            .map_err(|_| "AVI audio write failed")?;
+        v.audio_bytes += v.pending as u32;
+        v.movi_bytes += v.pending as u32 + 8;
+        v.pending = 0;
+        Ok(())
+    }
+    fn capture_video_audio(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let v = self.video.as_mut().unwrap();
+            if v.failed {
+                return;
+            }
+            let n = bytes.len().min(v.audio.len() - v.pending);
+            v.audio[v.pending..v.pending + n].copy_from_slice(&bytes[..n]);
+            v.pending += n;
+            bytes = &bytes[n..];
+            if v.pending == v.audio.len() {
+                if let Err(e) = self.flush_video_audio() {
+                    self.video.as_mut().unwrap().failed = true;
+                    self.message(e);
+                    return;
+                }
+            }
+        }
+    }
+    pub fn video_frame(&mut self, image: &[u8], new_frame: bool) {
+        let completed = self.encoder.take();
+        let Some(v) = self.video.as_mut() else {
+            return;
+        };
+        if let Some((generation, result)) = completed {
+            if generation == v.generation {
+                match result {
+                    Ok(jpeg) => v.jpeg = jpeg,
+                    Err(e) => {
+                        v.failed = true;
+                        self.status.clear();
+                        let _ = self.status.push_str(e);
+                    }
+                }
+            }
+        }
+        if new_frame || !v.submitted {
+            if self.encoder.submit(image, v.generation) {
+                v.submitted = true;
+            }
+        }
+        if v.failed || v.jpeg.is_empty() {
+            return;
+        }
+        // Audio sample counts are the timeline. Duplicate the latest complete
+        // image when capture is slower, rather than allowing A/V drift.
+        let target =
+            (v.audio_bytes + v.pending as u32).div_ceil(crate::avi::AUDIO_RATE / crate::avi::FPS);
+        if v.frames < target {
+            let result = (|| {
+                let s = self.storage.as_ref().ok_or("No SD")?;
+                s.fs.write(v.file, &crate::avi::chunk_header(true, v.jpeg.len() as u32))
+                    .map_err(|_| "AVI frame header failed")?;
+                s.fs.write(v.file, &v.jpeg)
+                    .map_err(|_| "AVI frame write failed")?;
+                if v.jpeg.len() & 1 != 0 {
+                    s.fs.write(v.file, &[0])
+                        .map_err(|_| "AVI frame padding failed")?;
+                }
+                Ok::<_, &'static str>(())
+            })();
+            match result {
+                Ok(()) => {
+                    v.frames += 1;
+                    v.movi_bytes += v.jpeg.len() as u32 + (v.jpeg.len() as u32 & 1) + 8;
+                    self.video_frames = v.frames;
+                    self.seconds = (v.audio_bytes + v.pending as u32) / crate::avi::AUDIO_RATE;
+                }
+                Err(e) => {
+                    v.failed = true;
+                    self.message(e);
+                }
+            }
+        }
+        if self
+            .video
+            .as_ref()
+            .map(|v| v.movi_bytes >= 1024 * 1024 * 1024)
+            .unwrap_or(false)
+        {
+            self.finish_video();
+            self.message("AVI saved at 1 GB limit");
+        }
+    }
+    fn finish_video(&mut self) {
+        let result = self.flush_video_audio();
+        let mut v = self.video.take().unwrap();
+        if result.is_err() {
+            v.failed = true;
+        }
+        if v.jpeg.is_empty() {
+            v.failed = true;
+        }
+        let result = (|| {
+            let s = self.storage.as_ref().ok_or("No SD")?;
+            // Pad the final video interval with the latest complete image.
+            let target = v
+                .audio_bytes
+                .div_ceil(crate::avi::AUDIO_RATE / crate::avi::FPS);
+            while !v.failed && !v.jpeg.is_empty() && v.frames < target {
+                s.fs.write(v.file, &crate::avi::chunk_header(true, v.jpeg.len() as u32))
+                    .map_err(|_| "AVI last frame header failed")?;
+                s.fs.write(v.file, &v.jpeg)
+                    .map_err(|_| "AVI last frame write failed")?;
+                if v.jpeg.len() & 1 != 0 {
+                    s.fs.write(v.file, &[0])
+                        .map_err(|_| "AVI frame padding failed")?;
+                }
+                v.frames += 1;
+                v.movi_bytes += v.jpeg.len() as u32 + (v.jpeg.len() as u32 & 1) + 8;
+            }
+            let size = crate::avi::HEADER_BYTES as u32 + v.movi_bytes;
+            s.fs.file_seek_from_start(v.file, 0)
+                .map_err(|_| "AVI header seek failed")?;
+            s.fs.write(
+                v.file,
+                &crate::avi::header(size, v.frames, v.audio_bytes, v.movi_bytes),
+            )
+            .map_err(|_| "AVI header finalize failed")?;
+            s.fs.flush_file(v.file).map_err(|_| "AVI flush failed")?;
+            Ok::<_, &'static str>(())
+        })();
+        let closed = self
+            .storage
+            .as_ref()
+            .map(|s| s.fs.close_file(v.file).is_ok())
+            .unwrap_or(false);
+        self.video_frames = v.frames;
+        self.refresh();
+        if result.is_err() || !closed || v.failed {
+            self.message("AVI save incomplete - check SD");
+        } else {
+            self.message("Video + microphone saved (AVI in SD root)");
+            esp_println::println!(
+                "video saved: {} frames={} audio={} bytes={}",
+                v.name,
+                v.frames,
+                v.audio_bytes,
+                crate::avi::HEADER_BYTES as u32 + v.movi_bytes
+            );
         }
     }
     fn install_demo(&self) -> Result<(), &'static str> {
@@ -408,6 +637,10 @@ impl Media {
         Err("WAV has no data chunk")
     }
     pub fn stop(&mut self, audio: &mut Audio) {
+        let had_video = self.video.is_some();
+        if had_video {
+            self.finish_video();
+        }
         if let Some(p) = self.player.take() {
             if let Some(s) = &self.storage {
                 if s.fs.close_file(p.file).is_err() {
@@ -461,13 +694,17 @@ impl Media {
                     self.message("Recording saved - REPLAY to listen");
                 }
             }
-        } else {
+        } else if !had_video {
             self.message("Stopped");
         }
         self.output_len = 0;
         self.output_pos = 0;
     }
     pub fn capture(&mut self, mut bytes: &[u8]) {
+        if self.video.is_some() {
+            self.capture_video_audio(bytes);
+            return;
+        }
         if self.record_failed {
             return;
         }

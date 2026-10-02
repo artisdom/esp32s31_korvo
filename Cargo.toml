@@ -31,7 +31,9 @@ block-device-driver = "0.2"
 aligned             = "0.4"
 embedded-sdmmc = { path = "vendor/embedded-sdmmc", default-features = false }
 nanomp3-core = { version = "0.2", default-features = false }
+jpeg-encoder = { version = "0.7.1", default-features = false }
 
+critical-section = "1.2"
 static_cell = "2"
 heapless    = "0.8"
 libm        = "0.2"

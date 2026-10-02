@@ -6,3 +6,4 @@ publish = false
 [dependencies]
 embedded-sdmmc = { path = "../../vendor/embedded-sdmmc", default-features = false }
 nanomp3-core = {version="0.2",default-features=false}
+jpeg-encoder = { version = "0.7.1", default-features = false }

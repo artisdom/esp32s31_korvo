@@ -144,12 +144,22 @@ impl Storage {
         })
     }
     pub fn create_recording(&self) -> Result<(RawFile, Name), &'static str> {
+        self.create_numbered("REC", "WAV")
+    }
+    pub fn create_video(&self) -> Result<(RawFile, Name), &'static str> {
+        self.create_numbered("VID", "AVI")
+    }
+    fn create_numbered(
+        &self,
+        prefix: &str,
+        extension: &str,
+    ) -> Result<(RawFile, Name), &'static str> {
         let mut next = 1u32;
         self.fs
             .iterate_dir(self.root, |entry| {
                 let mut name = Name::new();
                 let _ = write!(name, "{}", entry.name);
-                if name.len() == 12 && name.starts_with("REC") && name.ends_with(".WAV") {
+                if name.len() == 12 && name.starts_with(prefix) && name[9..] == *extension {
                     if let Ok(index) = name[3..8].parse::<u32>() {
                         next = next.max(index + 1);
                     }
@@ -161,7 +171,7 @@ impl Storage {
             return Err("recording names full");
         }
         let mut name = Name::new();
-        let _ = write!(name, "REC{:05}.WAV", next);
+        let _ = write!(name, "{}{:05}.{}", prefix, next, extension);
         self.fs
             .open_file_in_dir(self.root, name.as_str(), Mode::ReadWriteCreate)
             .map(|file| (file, name))

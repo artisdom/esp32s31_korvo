@@ -2,10 +2,10 @@
 //!
 //! Drives every peripheral on the board:
 //! 4.3" RGB LCD + GT1151 touch, ES8389 codec (speaker + mics) over I2S,
-//! WS2812 LED (RMT), ADC button ladder, microSD (SDMMC), DVP camera SCCB
-//! probe, USB 2.0 HS CDC-ACM on the Type-A port, PSRAM heap, dual core.
+//! WS2812 LED (RMT), ADC button ladder, microSD (SDMMC), DVP camera + AVI recorder,
+//! USB 2.0 HS CDC-ACM on the Type-A port, PSRAM heap, dual core.
 //!
-//! Core 0: hardware bring-up + UI/event loop. Core 1: USB device task.
+//! Core 0: hardware bring-up + UI/event loop. Core 1: JPEG compression + USB device task.
 
 #![no_std]
 #![no_main]
@@ -28,20 +28,25 @@ use static_cell::StaticCell;
 
 mod audio;
 mod audio_ring;
+mod avi;
 mod board;
 mod button_logic;
 mod buttons;
 mod camera;
 mod console;
+mod core_memory;
 mod delete_request;
 mod display;
 mod es8389;
 mod fat_layout;
 mod font;
 mod gfx;
+mod jpeg_worker;
 mod led;
 mod media;
 mod pcm;
+mod psram_buffer;
+mod sc101iot_regs;
 mod sdcard;
 mod storage;
 mod touch;
@@ -255,6 +260,17 @@ async fn main(_spawner: embassy_executor::Spawner) {
         ),
     }
 
+    let mut camera_stream =
+        camera
+            .ok()
+            .and_then(|camera| match camera::Stream::new(camera, i2c, cam_probe) {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    println!("camera capture setup: {}", e);
+                    None
+                }
+            });
+
     // --- microSD -----------------------------------------------------------------------------
     let sd_power = Output::new(peripherals.GPIO39, Level::High, OutputConfig::default());
     let sd_pins = sdcard::SdPins {
@@ -283,21 +299,26 @@ async fn main(_spawner: embassy_executor::Spawner) {
             None
         }
     });
-    let mut media = media::Media::new(storage);
+    static JPEG_WORKER: StaticCell<jpeg_worker::Worker> = StaticCell::new();
+    let encoder = &*JPEG_WORKER.init(jpeg_worker::Worker::new());
+    let mut media = media::Media::new(storage, encoder);
 
     // --- buttons -------------------------------------------------------------------------------
     let mut buttons = buttons::Buttons::new(peripherals.ADC1, peripherals.GPIO42);
     step("buttons ok");
 
     // --- USB CDC task on core 1 -------------------------------------------------------------------
-    static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+    static CORE1_STACK: StaticCell<Stack<65536>> = StaticCell::new();
     let stack = CORE1_STACK.init(Stack::new());
     let usb_hs = peripherals.USB_HS;
+    let core_memory = core_memory::Pma::snapshot();
     esp_rtos::start_second_core(peripherals.CPU_CTRL, stack, move || {
+        core_memory.install();
         static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
         let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
         executor.run(|spawner| {
             spawner.spawn(usb::usb_task(usb_hs).expect("spawn usb"));
+            spawner.spawn(jpeg_task(encoder).expect("spawn JPEG"));
         });
     });
     step("core1 usb task");
@@ -330,6 +351,11 @@ async fn main(_spawner: embassy_executor::Spawner) {
         delete_name: None,
         media_seconds: 0,
         recording: false,
+        video_recording: false,
+        video_name: heapless::String::new(),
+        video_frames: 0,
+        camera_frames: 0,
+        camera_errors: 0,
         uptime_s: 0,
         fps: 0,
         touch_point: None,
@@ -357,8 +383,12 @@ async fn main(_spawner: embassy_executor::Spawner) {
         LOOP_COUNT.fetch_add(1, Ordering::Relaxed);
 
         if let Some(cmd) = console.poll() {
+            st.page = if matches!(cmd, media::Command::VideoRecord) {
+                Page::Camera
+            } else {
+                Page::Audio
+            };
             media.command(cmd, &mut audio);
-            st.page = Page::Audio;
         }
 
         // ---- buttons ----
@@ -369,7 +399,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
                     st.page = st.page.next();
                 }
                 Button::Set => {
-                    if st.page == Page::Audio {
+                    if st.page == Page::Camera {
+                        media.command(media::Command::VideoRecord, &mut audio);
+                    } else if st.page == Page::Audio {
                         media.command(media::Command::Record, &mut audio);
                     } else {
                         media.command(media::Command::Stop, &mut audio);
@@ -409,7 +441,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 if let Some(page) = ui::hit_tabs(x, y) {
                     media.delete_request.cancel();
                     st.page = page;
-                } else if matches!(st.page, Page::Audio | Page::Storage) {
+                } else if matches!(st.page, Page::Audio | Page::Storage | Page::Camera) {
                     if let Some(cmd) =
                         ui::hit_media(st.page, x, y, media.delete_request.name().is_some())
                     {
@@ -428,7 +460,25 @@ async fn main(_spawner: embassy_executor::Spawner) {
             codec.set_pa(want_speaker);
             speaker_enabled = want_speaker;
         }
+        let repaint_page = shown_page != st.page;
+        if repaint_page {
+            if let Some(camera) = camera_stream.as_mut() {
+                camera.pause();
+            }
+        }
+        let camera_new_frame = camera_stream
+            .as_mut()
+            .map(|camera| {
+                camera.poll(!repaint_page && (st.page == Page::Camera || media.video_recording()))
+            })
+            .unwrap_or(false);
+        if let Some(camera) = camera_stream.as_ref() {
+            media.camera_ready = camera.count > 0;
+        }
         media.capture(audio.poll());
+        if let Some(camera) = camera_stream.as_ref() {
+            media.video_frame(&camera.frame, camera_new_frame);
+        }
         media.poll(&mut audio);
         st.media_name.clear();
         let _ = st.media_name.push_str("Selected: ");
@@ -445,6 +495,11 @@ async fn main(_spawner: embassy_executor::Spawner) {
         st.delete_name = media.delete_request.name().cloned();
         st.media_seconds = media.seconds;
         st.recording = media.recording();
+        st.video_recording = media.video_recording();
+        st.video_name = media.video_name.clone();
+        st.video_frames = media.video_frames;
+        st.camera_frames = camera_stream.as_ref().map(|c| c.count).unwrap_or(0);
+        st.camera_errors = camera_stream.as_ref().map(|c| c.errors).unwrap_or(0);
         st.mic_level = audio.mic_level;
         st.audio_source = audio.source();
 
@@ -470,6 +525,12 @@ async fn main(_spawner: embassy_executor::Spawner) {
             display.flush_rects(&dirty.as_slice());
         }
 
+        if st.page == Page::Camera && camera_new_frame {
+            if let Some(camera) = camera_stream.as_ref() {
+                ui::draw_camera_frame(&mut display.canvas(), &camera.frame);
+                display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
+            }
+        }
         st.led_rgb = (0, 0, 0); // LED intentionally disabled.
 
         // periodic heartbeat (time-based: `frame` resets every second)
@@ -486,6 +547,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
             );
             display::log_stats();
             audio.log_stats();
+            if let Some(camera) = camera_stream.as_ref() {
+                println!("Camera: frames={} errors={}", camera.count, camera.errors);
+            }
             println!("WS2812: RMT errors={}", led.error_count());
         }
         // ---- fps ----
@@ -513,5 +577,13 @@ fn alloc_fb() -> Option<&'static mut [u8]> {
             return None;
         }
         Some(core::slice::from_raw_parts_mut(ptr, SIZE))
+    }
+}
+
+#[embassy_executor::task]
+async fn jpeg_task(worker: &'static jpeg_worker::Worker) {
+    loop {
+        worker.encode();
+        embassy_time::Timer::after_millis(2).await;
     }
 }

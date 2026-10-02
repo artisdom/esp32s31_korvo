@@ -63,6 +63,11 @@ pub struct AppStatus {
     pub sd_file_index: usize,
     pub delete_name: Option<crate::storage::Name>,
     pub recording: bool,
+    pub video_recording: bool,
+    pub video_name: crate::storage::Name,
+    pub video_frames: u32,
+    pub camera_frames: u32,
+    pub camera_errors: u32,
     pub uptime_s: u64,
     pub fps: u32,
     pub touch_point: Option<(u16, u16)>,
@@ -142,11 +147,14 @@ pub fn draw(c: &mut Canvas, st: &AppStatus) {
         Page::Home => page_home_dyn(c, st, &mut d),
         Page::Audio => page_audio_dyn(c, st, &mut d),
         Page::Storage => page_storage_dyn(c, st, &mut d),
-        Page::Camera => {}
+        Page::Camera => page_camera_dyn(c, st, &mut d),
         Page::About => page_about_dyn(c, st, &mut d),
     }
     draw_cursor(c, st.touch_point, None);
-    LAST_CURSOR.store(pack_cursor(st.touch_point), core::sync::atomic::Ordering::Relaxed);
+    LAST_CURSOR.store(
+        pack_cursor(st.touch_point),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Repaint only the dynamic widgets; returns the regions touched.
@@ -157,7 +165,7 @@ pub fn draw_dynamic(c: &mut Canvas, st: &AppStatus) -> Dirty {
         Page::Home => page_home_dyn(c, st, &mut d),
         Page::Audio => page_audio_dyn(c, st, &mut d),
         Page::Storage => page_storage_dyn(c, st, &mut d),
-        Page::Camera => {}
+        Page::Camera => page_camera_dyn(c, st, &mut d),
         Page::About => page_about_dyn(c, st, &mut d),
     }
     draw_cursor(c, st.touch_point, Some(&mut d));
@@ -209,7 +217,13 @@ fn draw_tabs(c: &mut Canvas, st: &AppStatus) {
     for (i, (page, label)) in PAGES.iter().enumerate() {
         let x = i * w;
         let active = *page == st.page;
-        c.rect(x, y, w - 2, TABS_H, if active { gfx::PANEL_HI } else { gfx::PANEL });
+        c.rect(
+            x,
+            y,
+            w - 2,
+            TABS_H,
+            if active { gfx::PANEL_HI } else { gfx::PANEL },
+        );
         let tw = Canvas::text_width(label, 2);
         c.text(
             x + (w - tw) / 2,
@@ -270,14 +284,44 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
     let soc = Card::new(8, CONTENT_Y, CW, CH1, c, "SoC");
     c.text(soc.x + 12, soc.y + 34, "ESP32-S31", gfx::TEXT, 1);
     c.text(soc.x + 12, soc.y + 50, "dual-core RISC-V", gfx::MUTED, 1);
-    c.text(soc.x + 12, soc.y + 104, "Wi-Fi 6 / BT 5.4 / 802.15.4", gfx::MUTED, 1);
-    c.text(soc.x + 12, soc.y + 120, "(radio: upstream esp-radio)", gfx::MUTED, 1);
+    c.text(
+        soc.x + 12,
+        soc.y + 104,
+        "Wi-Fi 6 / BT 5.4 / 802.15.4",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        soc.x + 12,
+        soc.y + 120,
+        "(radio: upstream esp-radio)",
+        gfx::MUTED,
+        1,
+    );
 
     let mem = Card::new(8 + CW + GAP, CONTENT_Y, CW, CH1, c, "Memory");
     c.text(mem.x + 12, mem.y + 74, "16 MB flash (QIO)", gfx::MUTED, 1);
-    c.text(mem.x + 12, mem.y + 90, "16 MB PSRAM (hex 250 MHz)", gfx::MUTED, 1);
-    c.text(mem.x + 12, mem.y + 112, "framebuffer: PSRAM DMA", gfx::MUTED, 1);
-    c.text(mem.x + 12, mem.y + 128, "ring descriptors: DRAM", gfx::MUTED, 1);
+    c.text(
+        mem.x + 12,
+        mem.y + 90,
+        "16 MB PSRAM (hex 250 MHz)",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        mem.x + 12,
+        mem.y + 112,
+        "framebuffer: PSRAM DMA",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        mem.x + 12,
+        mem.y + 128,
+        "ring descriptors: DRAM",
+        gfx::MUTED,
+        1,
+    );
 
     let con = Card::new(8 + 2 * (CW + GAP), CONTENT_Y, CW, CH1, c, "Console + touch");
     c.rect(
@@ -285,7 +329,11 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
         con.y + 36,
         10,
         10,
-        if st.touch_id.is_some() { gfx::OK } else { gfx::ERR },
+        if st.touch_id.is_some() {
+            gfx::OK
+        } else {
+            gfx::ERR
+        },
     );
     c.text(con.x + 28, con.y + 34, "GT1151 touch", gfx::TEXT, 1);
     if let Some(id) = st.touch_id {
@@ -293,9 +341,21 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
         let _ = write!(s, "id \"{}\"", core::str::from_utf8(&id).unwrap_or("????"));
         c.text(con.x + 12, con.y + 52, &s, gfx::MUTED, 1);
     }
-    c.text(con.x + 12, con.y + 76, "UART log: 115200 8N1", gfx::MUTED, 1);
+    c.text(
+        con.x + 12,
+        con.y + 76,
+        "UART log: 115200 8N1",
+        gfx::MUTED,
+        1,
+    );
     c.text(con.x + 12, con.y + 92, "USB-C port (FT232R)", gfx::MUTED, 1);
-    c.text(con.x + 12, con.y + 114, "touch the tabs to navigate", gfx::MUTED, 1);
+    c.text(
+        con.x + 12,
+        con.y + 114,
+        "touch the tabs to navigate",
+        gfx::MUTED,
+        1,
+    );
 
     let btn = Card::new(8, ROW2_Y, CW, CH2, c, "Buttons (ADC ladder)");
     let names = ["VOL+  380mV", "VOL-  820mV", "MODE 1340mV", "SET  1870mV"];
@@ -305,10 +365,23 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
     }
 
     let usb = Card::new(8 + CW + GAP, ROW2_Y, CW, CH2, c, "USB HS (Type-A)");
-    c.text(usb.x + 12, usb.y + 100, "screen /dev/ttyACM0", gfx::MUTED, 1);
+    c.text(
+        usb.x + 12,
+        usb.y + 100,
+        "screen /dev/ttyACM0",
+        gfx::MUTED,
+        1,
+    );
     c.text(usb.x + 12, usb.y + 116, "send ? for info", gfx::MUTED, 1);
 
-    let led = Card::new(8 + 2 * (CW + GAP), ROW2_Y, CW, CH2, c, "Status LED (WS2812)");
+    let led = Card::new(
+        8 + 2 * (CW + GAP),
+        ROW2_Y,
+        CW,
+        CH2,
+        c,
+        "Status LED (WS2812)",
+    );
     c.text(led.x + 60, led.y + 66, "disabled", gfx::TEXT, 1);
     c.text(led.x + 60, led.y + 82, "LED off", gfx::MUTED, 1);
     c.text(led.x + 60, led.y + 102, "", gfx::TEXT, 1);
@@ -350,7 +423,14 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         let mut s: heapless::String<32> = heapless::String::new();
         let _ = write!(s, "GPIO42: {} mV", st.btn_mv);
         c.text(card.x + 12, card.y + 32, &s, gfx::TEXT, 1);
-        c.bar(card.x + 12, card.y + 48, CW - 24, 10, st.btn_mv as f32 / 2000.0, gfx::SKY);
+        c.bar(
+            card.x + 12,
+            card.y + 48,
+            CW - 24,
+            10,
+            st.btn_mv as f32 / 2000.0,
+            gfx::SKY,
+        );
         let held = [Button::VolUp, Button::VolDown, Button::Mode, Button::Set];
         for (i, b) in held.iter().enumerate() {
             let on = st.btn_held == Some(*b);
@@ -363,9 +443,19 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
             );
             // begin_dyn cleared this whole area, including the static labels.
             let mut label: heapless::String<24> = heapless::String::new();
-            let _ = write!(label, "{:<4} {:4}mV", b.label(), crate::button_logic::CENTERS_MV[i]);
-            c.text(card.x + 30, card.y + 104 + i * 18, &label,
-                if on { gfx::TEXT } else { gfx::MUTED }, 1);
+            let _ = write!(
+                label,
+                "{:<4} {:4}mV",
+                b.label(),
+                crate::button_logic::CENTERS_MV[i]
+            );
+            c.text(
+                card.x + 30,
+                card.y + 104 + i * 18,
+                &label,
+                if on { gfx::TEXT } else { gfx::MUTED },
+                1,
+            );
         }
         d.push(r).ok();
     }
@@ -378,12 +468,20 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
             card.y + 26,
             10,
             10,
-            if st.usb_connected { gfx::OK } else { gfx::PANEL_HI },
+            if st.usb_connected {
+                gfx::OK
+            } else {
+                gfx::PANEL_HI
+            },
         );
         c.text(
             card.x + 28,
             card.y + 24,
-            if st.usb_connected { "CDC-ACM up" } else { "not connected" },
+            if st.usb_connected {
+                "CDC-ACM up"
+            } else {
+                "not connected"
+            },
             gfx::TEXT,
             1,
         );
@@ -403,12 +501,7 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         let (red, green, blue) = st.led_rgb;
         let color = gfx::rgb565(red, green, blue);
         c.circle(card.x + 28, card.y + 96, 20, color);
-        c.circle(
-            card.x + 28,
-            card.y + 96,
-            12,
-            color,
-        );
+        c.circle(card.x + 28, card.y + 96, 12, color);
         d.push(r).ok();
     }
 }
@@ -417,6 +510,16 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
 
 pub fn hit_media(page: Page, x: u16, y: u16, confirming: bool) -> Option<crate::media::Command> {
     use crate::media::Command;
+    if page == Page::Camera {
+        if (400..=447).contains(&y) {
+            return match x {
+                20..=183 => Some(Command::VideoRecord),
+                192..=355 => Some(Command::Stop),
+                _ => None,
+            };
+        }
+        return None;
+    }
     let top = if page == Page::Audio { 280 } else { 348 };
     if (548..=779).contains(&x) {
         if confirming && (top + 60..=top + 107).contains(&y) {
@@ -697,41 +800,83 @@ fn page_storage_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
 // ---------------------------------------------------------------- CAMERA
 
 fn page_camera_static(c: &mut Canvas, st: &AppStatus) {
-    let y = CONTENT_Y;
-    let cam = Card::new(8, y, 784, 130, c, "DVP camera");
-    match st.camera.sensor {
-        Some((name, pid)) => {
-            c.rect(cam.x + 12, cam.y + 36, 10, 10, gfx::OK);
-            let mut s: heapless::String<48> = heapless::String::new();
-            let _ = write!(s, "{} detected (PID 0x{:04X})", name, pid);
-            c.text(cam.x + 28, cam.y + 34, &s, gfx::TEXT, 1);
-        }
-        None => {
-            c.rect(cam.x + 12, cam.y + 36, 10, 10, gfx::ERR);
-            c.text(cam.x + 28, cam.y + 34, "no sensor answered on SCCB", gfx::TEXT, 1);
+    Card::new(
+        8,
+        CONTENT_Y,
+        784,
+        384,
+        c,
+        "SC101IOT camera + microphone video recorder",
+    );
+    c.rect(20, 120, 320, 240, gfx::BLACK);
+    let mut sensor = heapless::String::<64>::new();
+    let _ = write!(
+        sensor,
+        "{} / 320 x 240",
+        st.camera.sensor.map(|s| s.0).unwrap_or("No sensor")
+    );
+    c.text(364, 124, &sensor, gfx::TEXT, 1);
+    c.text(364, 146, "AVI: MJPEG / 5 fps + stereo PCM", gfx::MUTED, 1);
+    c.text(364, 168, "Microphone: 48 kHz / 16 bit", gfx::MUTED, 1);
+    c.text(364, 190, "Speaker stays off while recording", gfx::MUTED, 1);
+    c.text(
+        364,
+        212,
+        "SET starts / saves video on this tab",
+        gfx::MUTED,
+        1,
+    );
+    for (x, label) in [(20, "RECORD / SAVE"), (192, "STOP / SAVE")] {
+        c.rect(x, 400, 164, 48, gfx::PANEL_HI);
+        c.text(x + 10, 418, label, gfx::ACCENT, 1);
+    }
+    c.text(364, 406, "AVI files appear in SD CARD.", gfx::MUTED, 1);
+    c.text(364, 428, "Stop before removing SD / power.", gfx::MUTED, 1);
+    c.text(
+        20,
+        460,
+        "Open preview before recording; JPEG video + microphone are saved together.",
+        gfx::MUTED,
+        1,
+    );
+}
+fn page_camera_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
+    c.rect(364, 242, 416, 122, gfx::PANEL);
+    c.text(
+        364,
+        242,
+        if st.camera_frames == 0 {
+            "Waiting for camera frames..."
+        } else if st.video_recording {
+            "RECORDING VIDEO + MICROPHONE"
+        } else {
+            "Camera ready"
+        },
+        if st.video_recording {
+            gfx::WARN
+        } else {
+            gfx::OK
+        },
+        1,
+    );
+    c.text(364, 264, &st.video_name, gfx::ACCENT, 2);
+    let mut counts = heapless::String::<96>::new();
+    let _ = write!(
+        counts,
+        "Preview {}  retries {}  saved frames {}",
+        st.camera_frames, st.camera_errors, st.video_frames
+    );
+    c.text(364, 294, &counts, gfx::TEXT, 1);
+    c.text(364, 316, &st.media_status, gfx::TEXT, 1);
+    c.bar(364, 344, 240, 12, st.mic_level.min(1.0), gfx::OK);
+    d.push(Rect::new(364, 242, 416, 122)).ok();
+}
+pub fn draw_camera_frame(c: &mut Canvas, frame: &[u8]) {
+    for y in 0..crate::avi::HEIGHT {
+        for x in 0..crate::avi::WIDTH {
+            c.set(20 + x, 120 + y, crate::avi::rgb565(frame, x, y));
         }
     }
-    c.text(
-        cam.x + 12,
-        cam.y + 58,
-        "8-bit DVP: D0..D7 GPIO46..53, PCLK 54, XCLK 55, VSYNC 56, HREF 57",
-        gfx::MUTED,
-        1,
-    );
-    c.text(
-        cam.x + 12,
-        cam.y + 78,
-        "SCCB shares the I2C bus with codec/touch (GPIO0/1)",
-        gfx::MUTED,
-        1,
-    );
-
-    let why = Card::new(8, y + 138, 784, 480 - y - 138 - 8, c, "Why not streaming video?");
-    c.text(why.x + 16, why.y + 34, "esp-hal merged the ESP32-S31 DVP (LCD_CAM) driver after v1.2.2, but a", gfx::TEXT, 1);
-    c.text(why.x + 16, why.y + 52, "Rust register driver for the OV3660/SC101IOT sensors does not exist yet", gfx::TEXT, 1);
-    c.text(why.x + 16, why.y + 70, "(the stock firmware uses ~2k lines of vendor init tables).", gfx::TEXT, 1);
-    c.text(why.x + 16, why.y + 94, "Next step: port esp_cam_sensor init tables, then DVP->LCD passthrough", gfx::MUTED, 1);
-    c.text(why.x + 16, why.y + 112, "becomes possible with esp_hal::lcd_cam::cam.", gfx::MUTED, 1);
 }
 
 // ---------------------------------------------------------------- ABOUT
@@ -739,17 +884,63 @@ fn page_camera_static(c: &mut Canvas, st: &AppStatus) {
 fn page_about_static(c: &mut Canvas, st: &AppStatus) {
     let y = CONTENT_Y;
     let a = Card::new(8, y, 784, 480 - y - 8, c, "About");
-    c.text(a.x + 16, a.y + 34, "ESP32-S31-Korvo-1 + ESP32-S31-WROOM-3 (16M flash / 16M PSRAM)", gfx::TEXT, 1);
-    c.text(a.x + 16, a.y + 50, "4.3\" 800x480 RGB LCD (ST7262E43) + GT1151 touch, ES8389 audio,", gfx::TEXT, 1);
-    c.text(a.x + 16, a.y + 66, "DVP camera, WS2812 LED, ADC button ladder, microSD, USB 2.0 HS.", gfx::TEXT, 1);
+    c.text(
+        a.x + 16,
+        a.y + 34,
+        "ESP32-S31-Korvo-1 + ESP32-S31-WROOM-3 (16M flash / 16M PSRAM)",
+        gfx::TEXT,
+        1,
+    );
+    c.text(
+        a.x + 16,
+        a.y + 50,
+        "4.3\" 800x480 RGB LCD (ST7262E43) + GT1151 touch, ES8389 audio,",
+        gfx::TEXT,
+        1,
+    );
+    c.text(
+        a.x + 16,
+        a.y + 66,
+        "DVP camera, WS2812 LED, ADC button ladder, microSD, USB 2.0 HS.",
+        gfx::TEXT,
+        1,
+    );
     c.text(a.x + 16, a.y + 94, "100% Rust firmware:", gfx::ACCENT, 1);
-    c.text(a.x + 16, a.y + 110, "esp-hal (git main, pre-1.3: S31 I2S/LCD_CAM/USB-HS), esp-rtos,", gfx::MUTED, 1);
-    c.text(a.x + 16, a.y + 126, "embassy, esp-bootloader-esp-idf second stage.", gfx::MUTED, 1);
-    c.text(a.x + 16, a.y + 154, "Feature status on this build:", gfx::ACCENT, 1);
+    c.text(
+        a.x + 16,
+        a.y + 110,
+        "esp-hal (git main, pre-1.3: S31 I2S/LCD_CAM/USB-HS), esp-rtos,",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        a.x + 16,
+        a.y + 126,
+        "embassy, esp-bootloader-esp-idf second stage.",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        a.x + 16,
+        a.y + 154,
+        "Feature status on this build:",
+        gfx::ACCENT,
+        1,
+    );
     let rows: [(&str, &str); 9] = [
         ("RGB LCD + framebuffer", "works - PSRAM ring DMA @ 35 Hz"),
-        ("Touch (GT1151)", if st.touch_id.is_some() { "works" } else { "no chip" }),
-        ("Audio playback (I2S+ES8389)", if st.codec_ok { "works" } else { "no codec" }),
+        (
+            "Touch (GT1151)",
+            if st.touch_id.is_some() {
+                "works"
+            } else {
+                "no chip"
+            },
+        ),
+        (
+            "Audio playback (I2S+ES8389)",
+            if st.codec_ok { "works" } else { "no codec" },
+        ),
         ("Mic capture", "works (RMS meter)"),
         (
             "microSD + FAT read",
@@ -769,7 +960,13 @@ fn page_about_static(c: &mut Canvas, st: &AppStatus) {
         c.text(a.x + 16, ry, k, gfx::TEXT, 1);
         c.text(a.x + 290, ry, v, gfx::MUTED, 1);
     }
-    c.text(a.x + 560, a.y + 94, "built with love & cargo", gfx::MUTED, 1);
+    c.text(
+        a.x + 560,
+        a.y + 94,
+        "built with love & cargo",
+        gfx::MUTED,
+        1,
+    );
 }
 
 fn page_about_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {

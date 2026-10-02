@@ -1,0 +1,22 @@
+//! Large application buffers explicitly use PSRAM, preserving internal RAM for DMA/radio.
+extern crate alloc;
+use alloc::{alloc::Layout, boxed::Box};
+pub fn zeroed(len: usize) -> Box<[u8]> {
+    if len == 0 {
+        return Box::default();
+    }
+    let layout = Layout::array::<u8>(len).expect("buffer layout");
+    #[cfg(target_arch = "riscv32")]
+    let ptr =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
+    #[cfg(not(target_arch = "riscv32"))]
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // Box uses the same global heap to free the allocation, with its original layout.
+    unsafe {
+        ptr.write_bytes(0, len);
+        Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
+    }
+}

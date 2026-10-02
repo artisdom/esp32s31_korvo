@@ -70,3 +70,10 @@ for the observed drift fix. Revisit them only if measured bandwidth or
 latency under additional workloads warrants it. Uncacheable and
 write-through mappings are different cache policies; neither guarantees
 that DMA underruns cannot occur.
+
+### Status LED disabled (2026-10-02)
+
+At the user's request, startup now transmits black once to clear any colour
+latched by earlier firmware. The main loop no longer sends colour or button
+feedback, and the UI labels the LED disabled. This is intentional: even the
+lowest nonzero WS2812 setting was too bright for comfortable use.

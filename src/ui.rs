@@ -303,10 +303,10 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
     c.text(usb.x + 12, usb.y + 116, "send ? for info", gfx::MUTED, 1);
 
     let led = Card::new(8 + 2 * (CW + GAP), ROW2_Y, CW, CH2, c, "Status LED (WS2812)");
-    c.text(led.x + 60, led.y + 66, "colour cycle:", gfx::TEXT, 1);
-    c.text(led.x + 60, led.y + 82, "system alive;", gfx::MUTED, 1);
-    c.text(led.x + 60, led.y + 102, "orange blink:", gfx::TEXT, 1);
-    c.text(led.x + 60, led.y + 118, "button event", gfx::MUTED, 1);
+    c.text(led.x + 60, led.y + 66, "disabled", gfx::TEXT, 1);
+    c.text(led.x + 60, led.y + 82, "LED off", gfx::MUTED, 1);
+    c.text(led.x + 60, led.y + 102, "", gfx::TEXT, 1);
+    c.text(led.x + 60, led.y + 118, "", gfx::MUTED, 1);
     c.text(led.x + 12, led.y + 150, "GPIO37, RMT-driven", gfx::MUTED, 1);
 }
 

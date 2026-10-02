@@ -136,7 +136,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
     step("splash shown");
 
 
-    // --- boot colour check on the WS2812 -------------------------------------------------
+    // --- disabled WS2812 -------------------------------------------------
     step("rmt");
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(10))
         .expect("RMT clock");
@@ -147,13 +147,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
     )
     .expect("LED channel");
     step("led ok");
-    // Low-brightness primary colours expose an incorrectly decoded bitstream.
-    for (name, rgb) in [("red", (1, 0, 0)), ("green", (0, 1, 0)), ("blue", (0, 0, 1))] {
-        let tx_start = Instant::now();
-        led.send(rgb.0, rgb.1, rgb.2);
-        println!("WS2812: boot {} (1/255), transfer {} us", name, tx_start.elapsed().as_micros());
-        Timer::after(Duration::from_millis(1000)).await;
-    }
+    // Latch off once, including any colour left from the previous firmware.
+    led.send(0, 0, 0);
+    step("status LED disabled");
 
     // --- shared I2C bus (codec + touch + camera SCCB) ------------------------------
     let mut i2c = I2c::new(
@@ -312,7 +308,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         fps: 0,
         touch_point: None,
         flash_led: false,
-        led_rgb: (0, 0, 1),
+        led_rgb: (0, 0, 0),
     };
 
     let start = Instant::now();
@@ -327,7 +323,6 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let mut frame = 0u32;
     let mut fps_window = Instant::now();
     let mut fps = 0u32;
-    let mut led_tick = Instant::now();
     let mut button_flash_until_ms = 0u64;
     let mut previous_held = None;
     let mut tone_on = false;
@@ -417,23 +412,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
             display.flush_rects(&dirty.as_slice());
         }
 
-        // ---- status LED: minimum-level colour cycle, orange on key press ----
-        if led_tick.elapsed().as_millis() >= 20 {
-            led_tick = Instant::now();
-            let elapsed_ms = start.elapsed().as_millis();
-            let led_phase = (elapsed_ms / 20) as u8;
-            let (r, g, b) = if st.flash_led {
-                (2, 1, 0)
-            } else {
-                let w = led::wheel(led_phase);
-                // At the minimum nonzero 8-bit level, choose the dominant
-                // channel instead of scaling the wheel into all-zero colours.
-                ((w.0 >= 128) as u8, (w.1 >= 128) as u8, (w.2 >= 128) as u8)
-            };
-            st.led_rgb = (r, g, b);
-            led.set(r, g, b);
-            led.update();
-        }
+        st.led_rgb = (0, 0, 0); // LED intentionally disabled.
 
         // periodic heartbeat (time-based: `frame` resets every second)
         if st.uptime_s != 0 && st.uptime_s % 10 == 0 && frame == 1 {

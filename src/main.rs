@@ -148,10 +148,10 @@ async fn main(_spawner: embassy_executor::Spawner) {
     .expect("LED channel");
     step("led ok");
     // Low-brightness primary colours expose an incorrectly decoded bitstream.
-    for (name, rgb) in [("red", (32, 0, 0)), ("green", (0, 32, 0)), ("blue", (0, 0, 32))] {
+    for (name, rgb) in [("red", (1, 0, 0)), ("green", (0, 1, 0)), ("blue", (0, 0, 1))] {
         let tx_start = Instant::now();
         led.send(rgb.0, rgb.1, rgb.2);
-        println!("WS2812: boot {} (32/255), transfer {} us", name, tx_start.elapsed().as_micros());
+        println!("WS2812: boot {} (1/255), transfer {} us", name, tx_start.elapsed().as_micros());
         Timer::after(Duration::from_millis(1000)).await;
     }
 
@@ -312,7 +312,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         fps: 0,
         touch_point: None,
         flash_led: false,
-        led_rgb: (0, 0, 32),
+        led_rgb: (0, 0, 1),
     };
 
     let start = Instant::now();
@@ -417,21 +417,18 @@ async fn main(_spawner: embassy_executor::Spawner) {
             display.flush_rects(&dirty.as_slice());
         }
 
-        // ---- status LED: slow colour cycle, orange flash on key press ----
+        // ---- status LED: minimum-level colour cycle, orange on key press ----
         if led_tick.elapsed().as_millis() >= 20 {
             led_tick = Instant::now();
             let elapsed_ms = start.elapsed().as_millis();
             let led_phase = (elapsed_ms / 20) as u8;
             let (r, g, b) = if st.flash_led {
-                (64, 16, 0)
+                (2, 1, 0)
             } else {
                 let w = led::wheel(led_phase);
-                let t = (elapsed_ms % 4000) as u32;
-                let triangle = if t < 2000 { t } else { 4000 - t };
-                let brightness = 16 + triangle * 84 / 2000;
-                ((w.0 as u32 * brightness / 255) as u8,
-                 (w.1 as u32 * brightness / 255) as u8,
-                 (w.2 as u32 * brightness / 255) as u8)
+                // At the minimum nonzero 8-bit level, choose the dominant
+                // channel instead of scaling the wheel into all-zero colours.
+                ((w.0 >= 128) as u8, (w.1 >= 128) as u8, (w.2 >= 128) as u8)
             };
             st.led_rgb = (r, g, b);
             led.set(r, g, b);

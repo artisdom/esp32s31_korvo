@@ -130,13 +130,18 @@ are direct tick counts (zero: 300/900 ns, one: 900/300 ns), without subtracting
 one. The first transmission error is logged; cumulative errors appear in
 UART heartbeats.
 
-Updates run every 20 ms, with a time-based colour cycle and brightness pulse.
+Updates run every 20 ms with a time-based colour cycle. Brightness is now
+the minimum nonzero 8-bit level: 1/255 on the active channel. Scaling a
+mixed colour down to this level would round it to black, so the cycle
+selects the dominant primary colour. The earlier breathing brightness
+pulse has been removed to keep output at the requested minimum.
 Button feedback stays orange while any debounced key is held and for one
 second after release. The initial 250 ms press-only flash was difficult
 to confirm and expired during long holds; the deadline now renews on every
-held-button poll. Feedback RGB is (64,16,0), reduced from (255,102,0) after
-the user reported that the bright output looked white. Startup shows dim
-red, green and blue for one second each and logs the configured counter
+held-button poll. Feedback RGB is now (2,1,0), the smallest integer
+red/green combination with more red than green for orange. This replaces
+(64,16,0) following a request to minimize brightness. Startup shows
+red, green and blue at 1/255 for one second each and logs the configured counter
 frequency and transfer duration as a colour/timing check. Steady transfers
 measured about 339 us, consistent with the nominal 328.8 us waveform plus
 software overhead; this is not a scope measurement of individual pulses.
@@ -171,3 +176,11 @@ through the hold and one second after release, using RGB (64,16,0).
 After flashing this change, the user confirmed correct red/green/blue
 startup colours and orange held-button feedback. RMT errors and LCD
 underruns remained zero in the serial capture.
+
+### Minimum brightness (2026-10-02)
+
+The user requested minimum brightness after the orange feedback fix.
+Startup and idle colour cycling now use level 1/255 on a single channel;
+button feedback uses (2,1,0) to preserve orange at the smallest integer
+levels. Hold and one-second release timing are unchanged. These levels
+are numeric channel values; visible brightness depends on the LED.

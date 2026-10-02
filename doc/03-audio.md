@@ -67,7 +67,8 @@ let i2s = I2s::new(
     TdmConfig::new_tdm_philips()
         .with_sample_rate(Rate::from_hz(48_000))
         .with_data_format(DataFormat::Data16Channel16)
-        .with_channels(Channels::STEREO),
+        .with_channels(Channels::STEREO)
+        .with_signal_loopback(true),
 )?;
 let i2s = i2s.with_mclk(peripherals.GPIO2);
 
@@ -82,37 +83,39 @@ let rx = i2s.i2s_rx
     .build();
 ```
 
-### Full-duplex clock caveat
+### Shared full-duplex clocks
 
-The codec is a slave sharing one BCLK/LRCLK pair for both directions.
-The TX unit generates those clocks; the RX unit runs as master off its
-own divider (same root clock, same ratio). The timings are nominally
-identical but not phase-locked — mic capture quality is not guaranteed.
-Playback is unaffected.
+The codec shares one BCLK/LRCLK pair. `TdmConfig::with_signal_loopback(true)`
+connects TX's clocks to RX internally and sets RX slave mode. The GPIO matrix
+also routes the wire BCLK/WS to RX. Both directions run at 48 kHz, 16-bit stereo.
 
-### Loopback for RX timing
+The vendor ratio-32 coefficient row requires register `0xF0` masked with
+`0x73` to receive **0x12**. The previous port wrote zero there; this is now
+corrected. Both microphone PGAs use 9.5 dB gain (the requested value 9 uses the
+vendor quantisation), and the ADC is explicitly unmuted. DAC-reference
+routing is disabled so both channels carry microphone input. The codec is
+initialised after I2S starts, because its clocks are derived from SCLK.
+RX EOF uses an aligned period of 1024, replacing the HAL streaming default
+0xfffe; the fixed-size ring requires complete descriptor payloads. Speaker output starts silent at -30 dB after user feedback that the
+old startup chime was too loud.
 
-```rust
-InputSignal::I2S0I_BCK.connect_to(&pins.bclk);
-InputSignal::I2S0I_WS.connect_to(&pins.ws);
-```
+## Continuous DMA
 
-This routes the TX-generated BCLK/WS into the RX timing inputs so the
-RX unit sees the same clocks the codec is timed by. Call these BEFORE
-the TX builder consumes the pins.
+`audio_ring.rs` implements `DmaTxBuffer` / `DmaRxBuffer` with permanent
+64 KiB descriptor rings. The DMA completed-descriptor addresses identify
+1024-byte blocks; the main loop reads capture and refills playback in batches
+up to 8192 bytes. Cache maintenance uses HAL DMA-aligned wrappers.
 
-## DMA streaming
+The previous `DmaTxStreamBuf` and `DmaRxStreamBuf` are linked streams rather
+than permanent rings: exhausting them can stop DMA. They stalled during
+boot/filesystem work. The ring implementation leaves clocks running, clears
+played blocks to silence, and counts producer underruns and capture overruns.
+Elapsed time resolves completed full ring wraps during long filesystem calls.
 
-Use `dma_tx_stream_buffer!` and `dma_rx_stream_buffer!` macros for
-statically-allocated circular buffers:
-
-```rust
-// ~100 ms of stereo 16-bit @ 48 kHz
-dma_tx_stream_buffer!(48000 / 10 * 4, 1024);
-```
-
-The TX transfer's `push_with()` closure generates samples; the RX
-transfer's `pop()` drains mic data. Both are polled from the main loop.
+A board test recorded 1,940,480 PCM bytes over approximately ten seconds and
+replayed the resulting WAV to completion, with zero RX overruns. Audible
+speech quality requires a separate user check. See
+[SD audio and recording](14-sd-audio-recording.md).
 
 ## Tone generation
 
@@ -121,10 +124,11 @@ a demo). Sources:
 - `Source::Chime` — 4-note arpeggio (C-E-G-C) with attack/release envelope
 - `Source::Tone(hz)` — steady sine at given frequency
 - `Source::Silence` — zero output
+- `Source::File` — PCM supplied by the SD playback/decoder path
 
 ## Volume control
 
 ```rust
-codec.set_volume_db(-6.0)?;  // -95.5 to +32 dB, mapped to reg 0x46/0x47
-codec.set_mic_gain(21)?;     // 0-36 dB, mapped to reg 0x72
+codec.set_volume_db(-30.0)?;  // -95.5 to +32 dB, mapped to reg 0x46/0x47
+codec.set_mic_gain(9)?;     // 0-36 dB, mapped to both 0x72 and 0x73
 ```

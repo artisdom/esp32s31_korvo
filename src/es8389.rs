@@ -6,7 +6,7 @@
 //! The sequence below mirrors `es8389_open` followed by `es8389_set_fs`
 //! (sample-rate coefficient block, bit-width/format, bias cycle).
 
-use crate::board::{SharedI2c, ES8389_I2C_ADDR as ADDR};
+use crate::board::{ES8389_I2C_ADDR as ADDR, SharedI2c};
 
 // Data format / bit values (es8389_reg.h)
 const S16_LE: u8 = 3 << 5;
@@ -23,10 +23,7 @@ pub struct Es8389 {
 pub type CodecResult<T> = Result<T, ()>;
 
 impl Es8389 {
-    pub fn new(
-        i2c: &'static SharedI2c,
-        pa_pin: Option<esp_hal::gpio::Output<'static>>,
-    ) -> Self {
+    pub fn new(i2c: &'static SharedI2c, pa_pin: Option<esp_hal::gpio::Output<'static>>) -> Self {
         Self { i2c, pa_pin }
     }
 
@@ -38,7 +35,10 @@ impl Es8389 {
 
     fn rd(&mut self, reg: u8) -> CodecResult<u8> {
         let mut buf = [0u8; 1];
-        match self.i2c.lock(|i2c| i2c.borrow_mut().write_read(ADDR, &[reg], &mut buf)) {
+        match self
+            .i2c
+            .lock(|i2c| i2c.borrow_mut().write_read(ADDR, &[reg], &mut buf))
+        {
             Ok(()) => Ok(buf[0]),
             Err(_) => Err(()),
         }
@@ -140,7 +140,7 @@ impl Es8389 {
         self.upd(0x01, MASK_MS_MODE, 0x00)?; // slave mode
         self.upd(0x02, 0xC0, 1 << 6)?; // clock from SCLK (no MCLK)
         self.upd(0x02, 0x02, 0x00)?; // MCLK not inverted
-        self.wr(0xF0, 0x12 | (1 << 3))?; // internal reference (ADCL + DACR)
+        self.wr(0xF0, 0x12)?; // both ADC microphone channels; no DAC reference
         self.upd(0x02, 0x01, 0x00)?; // SCLK not inverted
 
         // ---- es8389_set_fs(48000, 16) ----
@@ -161,7 +161,7 @@ impl Es8389 {
         self.wr(0x41, 0x7F)?;
         self.wr(0x42, 0x7F)?;
         self.upd(0x43, 0x81, 0x00)?;
-        self.upd(0xF0, 0x73, 0x00)?;
+        self.upd(0xF0, 0x73, 0x12)?; // 48 kHz / ratio-32 coefficient row
         self.wr(0xF1, 0x00)?;
         self.wr(0x16, 0x35)?;
         self.wr(0x18, 0x91)?;
@@ -218,20 +218,22 @@ impl Es8389 {
     /// Microphone PGA gain in dB (vendor quantization, 0..=36.5 dB).
     pub fn set_mic_gain(&mut self, db: u8) -> CodecResult<()> {
         let gain = match db {
-            0..=5 => 0x00,   // 0 dB
-            6..=8 => 0x01,   // 3.5 dB
-            9..=11 => 0x02,  // 6.5 dB
-            12..=14 => 0x03, // 9.5 dB
-            15..=17 => 0x04, // 12.5 dB
-            18..=20 => 0x05, // 15.5 dB
-            21..=23 => 0x06, // 18.5 dB
-            24..=26 => 0x07, // 21.5 dB
-            27..=29 => 0x08, // 24.5 dB
-            30..=32 => 0x09, // 27.5 dB
-            33..=35 => 0x0A, // 30.5 dB
-            _ => 0x0B,       // 33.5 dB
+            0 => 0x00,       // 0 dB
+            1..=5 => 0x01,   // 3.5 dB
+            6..=8 => 0x02,   // 6.5 dB
+            9..=11 => 0x03,  // 9.5 dB
+            12..=14 => 0x04, // 12.5 dB
+            15..=17 => 0x05, // 15.5 dB
+            18..=20 => 0x06, // 18.5 dB
+            21..=23 => 0x07, // 21.5 dB
+            24..=26 => 0x08, // 24.5 dB
+            27..=29 => 0x09, // 27.5 dB
+            30..=32 => 0x0A, // 30.5 dB
+            33..=35 => 0x0B, // 33.5 dB
+            _ => 0x0C,       // 36.5 dB
         };
-        self.wr(0x72, gain | (3 << 4))
+        self.wr(0x72, gain | (3 << 4))?;
+        self.wr(0x73, gain | (3 << 4))
     }
 
     /// NS4150B class-D power-amplifier enable (GPIO7, active-high).

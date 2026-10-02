@@ -1,4 +1,4 @@
-# microSD Card: SDMMC Host + FAT Inspection
+# microSD Card: SDMMC Host + FAT File Access
 
 ## Hardware
 
@@ -11,7 +11,8 @@ on GPIO39 (active-low — drive LOW to power the card).
 esp_hal::sdmmc::SdHostController     — SD host peripheral driver
   └── Slot<0> (async)                — slot with pin muxing
       └── sdio::DefaultBlockDevice   — SD card protocol (CMD0/8/41/2/3...)
-          └── read-only FAT inspector — MBR/boot-sector/dir parsing
+          ├── read-only boot inspector — card/partition/volume information
+          └── embedded-sdmmc FAT16/32 — track reads and new WAV recording files
 ```
 
 The `sdio` crate (v0.5) provides the card protocol on top of the
@@ -34,7 +35,17 @@ The demo includes a hand-rolled read-only FAT16/FAT32/exFAT detector:
 4. Parse the root directory (FAT16: fixed region; FAT32: cluster chain)
 5. Extract volume label, file entries, first .TXT file preview
 
-**Never writes to the card** — safe for user media.
+The boot inspector itself is read-only. The media layer now writes new
+recording files and optional demo tracks; existing files are never opened
+for writing. It does not format or repartition the card.
+
+`storage.rs` adapts native SDMMC to `embedded-sdmmc`. For superfloppy cards,
+`fat_layout.rs` supplies a virtual MBR at logical sector 0 and maps logical
+sector 1 to physical sector 0. That MBR exists only in RAM; writes to it are
+rejected. A host integration test verifies recording across clusters, reopening,
+existing-file preservation, and an unchanged physical boot sector.
+
+See [SD audio and recording](14-sd-audio-recording.md) for controls and limits.
 
 ## Key constants
 

@@ -18,10 +18,10 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 |---|---|---|---|
 | RGB LCD 800x480 | 16-bit bus, 18 MHz PCLK (35 Hz), framebuffer in PSRAM | `esp_hal::lcd_cam::lcd::dpi` + custom descriptor-ring DMA buffer | **works** — RGB transfer buffer enabled; horizontal drift stopped in the 2026-10-02 board check, with zero reported underruns during live updates |
 | Capacitive touch | GT1151 @ I2C 0x14 | this repo (`touch.rs`, 16-bit regs, checksummed reports) | **works** — polled, drives page navigation + cursor |
-| Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | **works** — on-chip synthesized chime/test tone, 48 kHz/16-bit |
-| Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | `esp_hal::i2s` DMA + RMS meter | **partial** — DMA delivers samples; full-duplex clocking of the slave codec is not phase-locked in esp-hal yet, so sample quality is not guaranteed |
-| microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + hand-rolled read-only FAT inspector | **works** (verified with a 128 GB card) — card info, partition/FAT type, volume label, root dir listing, first `.TXT` preview. Never writes. |
-| WS2812 status LED | GPIO37 | `esp_hal::rmt` | **works** — minimum-level colour cycling (1/255), orange (2,1,0) while a key is held and for 1 s after release; explicit RMT end marker and error reporting |
+| Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | SD MP3 and PCM WAV playback implemented; DMA completion verified on this board, audible chime confirmed |
+| Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | shared-clock I2S rings + RMS meter + FAT WAV recorder | sustained 48 kHz stereo recording and reopening verified; speech quality check pending |
+| microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + `embedded-sdmmc` | **works** on the 128 GB FAT32 card: file playback, new numbered WAV recordings, and read-only boot inspection |
+| WS2812 status LED | GPIO37 | `esp_hal::rmt` | **disabled at user request** — black latched once at startup; no animation or button feedback |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
 | USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
 | DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: 20 MHz XCLK from LCD_CAM + paged SCCB | **detected** — PID 0xda4a; capture is future work |
@@ -39,11 +39,17 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 
 - The title stays at the top; startup no longer asks for display-phase calibration.
 - **Touch** the tabs to switch pages (HOME / AUDIO / SD CARD / CAMERA / ABOUT).
-- **MODE** cycles pages and toggles a 440 Hz test tone.
-- **SET** replays the startup chime.
-- The LED uses 1/255 per active channel at startup and while colour cycling; held keys show orange (2,1,0) through release plus one second.
+- **MODE** cycles pages.
+- On **AUDIO**, **SET** starts recording or saves the active recording. On other pages, SET stops media and plays the test chime.
+- **AUDIO** controls: PREVIOUS / NEXT select a track; PLAY starts it; STOP ends playback or saves a recording; RECORD / SAVE toggles recording; REPLAY LAST plays the latest saved recording; RESCAN SD refreshes the list.
+- The LED stays off. Speaker audio starts silent, with default volume **-30 dB**.
 - **VOL+ / VOL-** change the ES8389 DAC volume in 3 dB steps.
   (Buttons require the ADC - see below.)
+
+Put MP3 or integer PCM WAV files in the FAT16/FAT32 card root before boot.
+The browser shows up to 64 files using their FAT 8.3 names/aliases. Recordings
+use new `REC00001.WAV`, `REC00002.WAV`, etc. files; existing files are preserved.
+Tap STOP to save before power-off or card removal. See [SD audio and recording](doc/14-sd-audio-recording.md) for formats, console commands, and validation.
 
 ## Buttons: why raw 0 means "idle"
 
@@ -98,7 +104,11 @@ src/
 ├── ui.rs        — pages + tab navigation
 ├── es8389.rs    — ES8389 register driver (port of esp_codec_dev es8389.c:
 │                  slave mode, SCLK-derived clocks, 48 kHz coeff table)
-├── audio.rs     — I2S0 TX+RX DMA streaming, tone/chime generator, mic RMS
+├── audio.rs     — shared-clock I2S0 TX+RX, synth and microphone meter
+├── audio_ring.rs — continuous DMA rings and completed-descriptor polling
+├── media.rs     — MP3/WAV playback and numbered WAV recording
+├── storage.rs   — writable FAT adapter over native SDMMC
+├── pcm.rs       — WAV format and streaming sample-rate conversion
 ├── touch.rs     — GT1151 polling driver
 ├── sdcard.rs    — SDMMC host + sdio card stack + read-only FAT16/32/exFAT detector
 ├── camera.rs    — DVP sensor SCCB probe
@@ -136,11 +146,12 @@ I2S, LCD_CAM (RGB + DVP) and USB-HS drivers for this chip only exist on
 `main` (expected in the next minor release), which is why all esp-rs deps
 point at a fixed local checkout of that revision.
 
-## Honest limitations
+## Current limitations
 
-- Mic capture quality: the codec is a slave on shared BCLK/LRCLK; esp-hal's
-  I2S full-duplex has no shared-clock mode, so RX timing is nominally-identical
-  but not phase-locked to TX. Playback is unaffected.
-- The UI redraws the full frame every tick (~18 fps); no dirty-rect tracking.
+- Root-directory browser, up to 64 MP3/WAV files; long names appear as FAT 8.3 aliases.
+- FAT16/FAT32 only for media; exFAT is detected by boot inspection but cannot play or record.
+- WAV: integer PCM, 8/16/24/32-bit, mono/stereo, 8–96 kHz. MP3: MPEG Layer III. AAC, Ogg, FLAC and float/extensible WAV are unsupported.
+- Playback converts to 48 kHz stereo with nearest-neighbour rate conversion. Gapless MP3 playback and higher-quality resampling are future improvements.
+- Recording uses 48 kHz stereo PCM16 WAV (~11.5 MB/minute). Save with STOP; there is no power-loss recovery or hot removal support.
+- FAT timestamps use a fixed date (2026-10-02); there is no real-time clock synchronisation.
 - Camera: probe only (see above). Radio: not attempted.
-- exFAT cards are detected but not listed (FAT16/FAT32 only).

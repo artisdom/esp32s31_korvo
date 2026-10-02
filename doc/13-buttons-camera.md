@@ -119,6 +119,10 @@ same channel for its RX half; it is never used because no transfer is started.
 
 ## 3. WS2812 status LED
 
+**Current behaviour (2026-10-02): disabled at user request.** Startup sends
+black once and there are no animations, button flashes or UI LED flashes.
+The following colour experiments describe earlier firmware.
+
 GPIO37 and RMT channel 0 match the board BSP. The original frame contained
 24 GRB bits and a reset-low symbol, but no RMT end marker. The HAL rejects
 such a frame with `EndMarkerMissing`; the previous driver discarded errors,

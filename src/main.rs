@@ -12,6 +12,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::{audio::Source, buttons::Button, ui::Page};
 use core::fmt::Write as _;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
@@ -22,21 +23,26 @@ use esp_hal::{
     time::Instant,
     timer::timg::TimerGroup,
 };
-use static_cell::StaticCell;
 use esp_println::println;
-use crate::{audio::Source, buttons::Button, ui::Page};
+use static_cell::StaticCell;
 
 mod audio;
+mod audio_ring;
 mod board;
-mod buttons;
 mod button_logic;
+mod buttons;
 mod camera;
+mod console;
 mod display;
 mod es8389;
+mod fat_layout;
 mod font;
 mod gfx;
 mod led;
+mod media;
+mod pcm;
 mod sdcard;
+mod storage;
 mod touch;
 mod ui;
 mod usb;
@@ -69,7 +75,8 @@ async fn main(_spawner: embassy_executor::Spawner) {
 
     // --- heaps: internal DRAM + PSRAM regions --------------------------------
     esp_alloc::heap_allocator!(size: 48 * 1024);
-    let psram = esp_hal::psram::Psram::new(peripherals.PSRAM, esp_hal::psram::PsramConfig::default());
+    let psram =
+        esp_hal::psram::Psram::new(peripherals.PSRAM, esp_hal::psram::PsramConfig::default());
     let (_psram_start, psram_size) = psram.raw_parts();
     unsafe {
         esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
@@ -118,14 +125,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
     } else {
         "camera XCLK failed"
     });
-    let mut display = match display::Display::new(lcd_cam.lcd, peripherals.DMA_AXI_CH0, fb, lcd_pins)
-    {
-        Ok(d) => {
-            step("LCD scanning");
-            d
-        }
-        Err(e) => panic!("display init failed: {}", e),
-    };
+    let mut display =
+        match display::Display::new(lcd_cam.lcd, peripherals.DMA_AXI_CH0, fb, lcd_pins) {
+            Ok(d) => {
+                step("LCD scanning");
+                d
+            }
+            Err(e) => panic!("display init failed: {}", e),
+        };
 
     {
         let mut c = display.canvas();
@@ -135,17 +142,15 @@ async fn main(_spawner: embassy_executor::Spawner) {
     display.flush();
     step("splash shown");
 
-
     // --- disabled WS2812 -------------------------------------------------
     step("rmt");
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(10))
         .expect("RMT clock");
-    println!("WS2812: configured RMT counter {} Hz", rmt.frequency().as_hz());
-    let mut led = led::StatusLed::new(
-        rmt,
-        peripherals.GPIO37,
-    )
-    .expect("LED channel");
+    println!(
+        "WS2812: configured RMT counter {} Hz",
+        rmt.frequency().as_hz()
+    );
+    let mut led = led::StatusLed::new(rmt, peripherals.GPIO37).expect("LED channel");
     step("led ok");
     // Latch off once, including any colour left from the previous firmware.
     led.send(0, 0, 0);
@@ -179,31 +184,15 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let pa_pin = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
     let mut codec = es8389::Es8389::new(i2c, Some(pa_pin));
     let codec_ok = codec.ping();
-    step(if codec_ok { "codec detected" } else { "codec MISSING" });
-    let codec_id = if codec_ok {
-        match codec.init_48k() {
-            Ok(()) => {
-                let _ = codec.set_volume_db(-6.0);
-                let _ = codec.set_mic_gain(21);
-                println!("ES8389 initialized: 48 kHz slave, SCLK-derived clocks");
-                codec.chip_id().unwrap_or((0, 0))
-            }
-            Err(()) => {
-                println!("ES8389 register init FAILED");
-                (0, 0)
-            }
-        }
+    step(if codec_ok {
+        "codec detected"
     } else {
-        (0, 0)
-    };
+        "codec MISSING"
+    });
 
     // --- I2S (builds on I2S0 with DMA_CH0; MCLK on GPIO2) -----------------------------
-    let i2s = audio::build_i2s(
-        peripherals.I2S0,
-        peripherals.DMA_CH0,
-        peripherals.GPIO2,
-    )
-    .expect("I2S0");
+    let i2s =
+        audio::build_i2s(peripherals.I2S0, peripherals.DMA_CH0, peripherals.GPIO2).expect("I2S0");
     let mut audio = {
         let pins = audio::AudioPins {
             bclk: peripherals.GPIO3,
@@ -219,8 +208,25 @@ async fn main(_spawner: embassy_executor::Spawner) {
             Err(e) => panic!("audio init failed: {}", e),
         }
     };
-    audio.set_source(Source::Chime); // startup arpeggio
+    let codec_id = if codec_ok {
+        match codec.init_48k() {
+            Ok(()) => {
+                let _ = codec.set_volume_db(-30.0);
+                let _ = codec.set_mic_gain(9);
+                let _ = codec.set_adc_mute(false);
+                println!("ES8389 initialized: 48 kHz slave, SCLK-derived clocks");
+                codec.chip_id().unwrap_or((0, 0))
+            }
+            Err(()) => {
+                println!("ES8389 register init FAILED");
+                (0, 0)
+            }
+        }
+    } else {
+        (0, 0)
+    };
 
+    // Audio starts silent; playback is always requested by a control.
 
     // --- touch ---------------------------------------------------------------------------
     let mut touch = touch::Touch::probe(i2c);
@@ -258,7 +264,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         d3: peripherals.GPIO23,
     };
     step("mounting microSD...");
-    let sd = sdcard::mount_and_inspect(peripherals.SDHOST, sd_pins, sd_power).await;
+    let (sd, card_device) = sdcard::mount_and_inspect(peripherals.SDHOST, sd_pins, sd_power).await;
     if sd.card_ok {
         println!(
             "microSD ok: {} MB, {} {}, label \"{}\"",
@@ -267,6 +273,15 @@ async fn main(_spawner: embassy_executor::Spawner) {
     } else {
         println!("microSD: {}", sd.error.unwrap_or("unknown failure"));
     }
+
+    let storage = card_device.and_then(|d| match storage::Storage::new(d) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            println!("media mount: {}", e);
+            None
+        }
+    });
+    let mut media = media::Media::new(storage);
 
     // --- buttons -------------------------------------------------------------------------------
     let mut buttons = buttons::Buttons::new(peripherals.ADC1, peripherals.GPIO42);
@@ -302,12 +317,16 @@ async fn main(_spawner: embassy_executor::Spawner) {
         btn_mv: 0,
         btn_held: None,
         mic_level: 0.0,
-        volume_db: -6.0,
+        volume_db: -30.0,
         audio_source: audio.source(),
+        media_name: heapless::String::new(),
+        media_status: heapless::String::new(),
+        media_count: 0,
+        media_seconds: 0,
+        recording: false,
         uptime_s: 0,
         fps: 0,
         touch_point: None,
-        flash_led: false,
         led_rgb: (0, 0, 0),
     };
 
@@ -323,27 +342,31 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let mut frame = 0u32;
     let mut fps_window = Instant::now();
     let mut fps = 0u32;
-    let mut button_flash_until_ms = 0u64;
     let mut previous_held = None;
-    let mut tone_on = false;
+    let mut previous_touch = false;
+    let mut console = console::Console::new();
 
     loop {
         LOOP_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(cmd) = console.poll() {
+            media.command(cmd, &mut audio);
+            st.page = Page::Audio;
+        }
 
         // ---- buttons ----
         if let Some(btn) = buttons.poll() {
             match btn {
                 Button::Mode => {
                     st.page = st.page.next();
-                    tone_on = !tone_on;
-                    audio.set_source(if tone_on {
-                        Source::Tone(440.0)
-                    } else {
-                        Source::Silence
-                    });
                 }
                 Button::Set => {
-                    audio.set_source(Source::Chime);
+                    if st.page == Page::Audio {
+                        media.command(media::Command::Record, &mut audio);
+                    } else {
+                        media.command(media::Command::Stop, &mut audio);
+                        audio.set_source(Source::Chime);
+                    }
                 }
                 Button::VolUp => {
                     st.volume_db = (st.volume_db + 3.0).min(20.0);
@@ -358,18 +381,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
         st.btn_mv = buttons.last_mv;
         st.btn_held = buttons.held();
         if st.btn_held != previous_held {
-            println!("button: {} raw={} mv={}",
-                st.btn_held.map(Button::label).unwrap_or("released"), buttons.last_raw, st.btn_mv);
+            println!(
+                "button: {} raw={} mv={}",
+                st.btn_held.map(Button::label).unwrap_or("released"),
+                buttons.last_raw,
+                st.btn_mv
+            );
             previous_held = st.btn_held;
         }
-        // Stay orange throughout a hold, then for one second after release.
-        // Renew the deadline every poll so long holds never lose feedback.
-        let now_ms = start.elapsed().as_millis();
-        if st.btn_held.is_some() {
-            button_flash_until_ms = now_ms + 1000;
-        }
-        st.flash_led = now_ms < button_flash_until_ms;
-
         // ---- touch ----
         // Touch, rendering and dirty regions all use screen coordinates.
         if let Some(t) = touch.as_mut() {
@@ -379,14 +398,30 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 println!("touch: {:?}", st.touch_point);
             }
             if let Some((x, y)) = st.touch_point {
-                if let Some(page) = ui::hit_tabs(x, y) {
-                    st.page = page;
+                if !previous_touch {
+                    if let Some(page) = ui::hit_tabs(x, y) {
+                        st.page = page;
+                    } else if st.page == Page::Audio {
+                        if let Some(cmd) = ui::hit_audio(x, y) {
+                            media.command(cmd, &mut audio);
+                        }
+                    }
                 }
             }
         }
 
-        // ---- audio streaming + mic meter ----
-        audio.poll();
+        previous_touch = st.touch_point.is_some();
+
+        // ---- audio streaming + SD playback / recording ----
+        media.capture(audio.poll());
+        media.poll(&mut audio);
+        st.media_name.clear();
+        let _ = st.media_name.push_str("Selected: ");
+        let _ = st.media_name.push_str(media.selected_name());
+        st.media_status = media.status.clone();
+        st.media_count = media.tracks.len();
+        st.media_seconds = media.seconds;
+        st.recording = media.recording();
         st.mic_level = audio.mic_level;
         st.audio_source = audio.source();
 
@@ -427,6 +462,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 esp_alloc::HEAP.free() / 1024
             );
             display::log_stats();
+            audio.log_stats();
             println!("WS2812: RMT errors={}", led.error_count());
         }
         // ---- fps ----

@@ -15,7 +15,6 @@ const RESET_TICKS: u16 = 1500; // 150 us per half: 300 us low before end marker
 
 pub struct StatusLed {
     channel: Option<Channel>,
-    pending: Option<(u8, u8, u8)>,
     errors: u32,
 }
 
@@ -34,21 +33,8 @@ impl StatusLed {
             .with_pin(pin);
         Ok(Self {
             channel: Some(channel),
-            pending: None,
             errors: 0,
         })
-    }
-
-    /// Queue a colour; takes effect on the next [`Self::update`] call.
-    pub fn set(&mut self, r: u8, g: u8, b: u8) {
-        self.pending = Some((r, g, b));
-    }
-
-    /// Push the pending colour out and wait for the short RMT transfer.
-    pub fn update(&mut self) {
-        if let Some((r, g, b)) = self.pending.take() {
-            self.send(r, g, b);
-        }
     }
 
     pub fn send(&mut self, r: u8, g: u8, b: u8) {
@@ -91,19 +77,5 @@ impl StatusLed {
         if self.errors == 1 {
             esp_println::println!("WS2812 RMT error: {}", error);
         }
-    }
-}
-
-/// Colour-cycle helper for the boot animation.
-pub fn wheel(pos: u8) -> (u8, u8, u8) {
-    let pos = pos % 255;
-    if pos < 85 {
-        (255 - pos * 3, pos * 3, 0)
-    } else if pos < 170 {
-        let p = pos - 85;
-        (0, 255 - p * 3, p * 3)
-    } else {
-        let p = pos - 170;
-        (p * 3, 0, 255 - p * 3)
     }
 }

@@ -54,10 +54,14 @@ pub struct AppStatus {
     pub mic_level: f32,
     pub volume_db: f32,
     pub audio_source: audio::Source,
+    pub media_name: heapless::String<64>,
+    pub media_status: heapless::String<64>,
+    pub media_seconds: u32,
+    pub media_count: usize,
+    pub recording: bool,
     pub uptime_s: u64,
     pub fps: u32,
     pub touch_point: Option<(u16, u16)>,
-    pub flash_led: bool,
     pub led_rgb: (u8, u8, u8),
 }
 
@@ -92,8 +96,6 @@ fn unpack_cursor(v: u32) -> Option<(u16, u16)> {
 struct Card {
     x: usize,
     y: usize,
-    w: usize,
-    h: usize,
 }
 
 impl Card {
@@ -101,11 +103,11 @@ impl Card {
         c.rect(x, y, w, h, gfx::PANEL);
         c.frame(x, y, w, h, gfx::PANEL_HI);
         c.text(x + 12, y + 8, title, gfx::SKY, 1);
-        Self { x, y, w, h }
+        Self { x, y }
     }
 
-    fn at(x: usize, y: usize, w: usize, h: usize) -> Self {
-        Self { x, y, w, h }
+    fn at(x: usize, y: usize, _w: usize, _h: usize) -> Self {
+        Self { x, y }
     }
 
     /// Erase a dynamic area of this card and return the dirty rect.
@@ -401,7 +403,7 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
             card.x + 28,
             card.y + 96,
             12,
-            if st.flash_led { gfx::WARN } else { color },
+            color,
         );
         d.push(r).ok();
     }
@@ -409,87 +411,108 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
 
 // ---------------------------------------------------------------- AUDIO
 
-fn page_audio_static(c: &mut Canvas, st: &AppStatus) {
-    let y = CONTENT_Y;
-    let spk = Card::new(8, y, 500, 150, c, "Speaker (ES8389 + 2x NS4150B, 3 W)");
-    let mut s: heapless::String<48> = heapless::String::new();
-    if st.codec_ok {
-        let _ = write!(s, "codec id 0x{:02X}:0x{:02X}", st.codec_id.0, st.codec_id.1);
-    } else {
-        s.push_str("not detected").ok();
-    }
-    c.rect(spk.x + 12, spk.y + 34, 10, 10, if st.codec_ok { gfx::OK } else { gfx::ERR });
-    c.text(spk.x + 28, spk.y + 32, &s, gfx::TEXT, 1);
-    c.text(spk.x + 12, spk.y + 54, "I2S0 48 kHz / 16-bit / stereo, DMA stream", gfx::MUTED, 1);
-    c.text(spk.x + 12, spk.y + 130, "SET = chime   MODE = 440 Hz   VOL+- = volume", gfx::MUTED, 1);
-
-    let y2 = y + 158;
-    let mic = Card::new(8, y2, 500, 480 - y2 - 8, c, "Microphones (2x analog, ADC loop)");
-    c.text(mic.x + 12, mic.y + 24, "speak into the left mic ->", gfx::MUTED, 1);
-
-    let chain = Card::new(516, y, 276, 480 - y - 8, c, "Signal chain");
-    c.text(chain.x + 12, chain.y + 34, "mic -> ES8389 ADC", gfx::MUTED, 1);
-    c.text(chain.x + 12, chain.y + 48, "    -> I2S0 RX DMA", gfx::MUTED, 1);
-    c.text(chain.x + 12, chain.y + 62, "    -> RMS meter", gfx::MUTED, 1);
-    c.text(chain.x + 12, chain.y + 86, "Rust synth -> I2S0 TX", gfx::MUTED, 1);
-    c.text(chain.x + 12, chain.y + 100, "    -> ES8389 DAC", gfx::MUTED, 1);
-    c.text(chain.x + 12, chain.y + 114, "    -> PA (GPIO7)", gfx::MUTED, 1);
-    c.text(chain.x + 12, chain.y + 138, "no external DSP:", gfx::TEXT, 1);
-    c.text(chain.x + 12, chain.y + 152, "waveforms are", gfx::TEXT, 1);
-    c.text(chain.x + 12, chain.y + 166, "generated on-chip", gfx::TEXT, 1);
-}
-
-fn page_audio_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
-    let y = CONTENT_Y;
-    // source + volume
-    {
-        let card = Card::at(8, y, 500, 150);
-        let r = card.begin_dyn(c, 6, 70, 488, 54);
-        let mut tone_buf: heapless::String<24> = heapless::String::new();
-        let src: &str = match st.audio_source {
-            audio::Source::Silence => "silence",
-            audio::Source::Tone(hz) => {
-                let _ = write!(tone_buf, "tone {:.0} Hz", hz);
-                tone_buf.as_str()
-            }
-            audio::Source::Chime => "chime",
+pub fn hit_audio(x: u16, y: u16) -> Option<crate::media::Command> {
+    use crate::media::Command;
+    if (280..=327).contains(&y) {
+        return match x {
+            20..=139 => Some(Command::Previous),
+            148..=267 => Some(Command::Next),
+            276..=395 => Some(Command::Play),
+            404..=523 => Some(Command::Stop),
+            _ => None,
         };
-        let mut s: heapless::String<32> = heapless::String::new();
-        let _ = write!(s, "source: {}", src);
-        c.text(card.x + 12, card.y + 76, &s, gfx::ACCENT, 1);
-        let mut v: heapless::String<32> = heapless::String::new();
-        let _ = write!(v, "volume {:+.0} dB", st.volume_db);
-        c.text(card.x + 12, card.y + 94, &v, gfx::TEXT, 1);
-        c.bar(card.x + 12, card.y + 112, 476, 10, (st.volume_db + 60.0) / 80.0, gfx::OK);
-        d.push(r).ok();
     }
-    // mic meter
-    {
-        let y2 = y + 158;
-        let card = Card::at(8, y2, 500, 480 - y2 - 8);
-        let bx = card.x + 12;
-        let bw = 420;
-        let by = card.y + 48;
-        let bh = card.h - 60;
-        let r = card.begin_dyn(c, 6, 40, 488, card.h - 46);
-        c.rect(bx, by, bw, bh, gfx::PANEL_HI);
-        let filled = (st.mic_level.clamp(0.0, 1.0) * bw as f32) as usize;
-        for i in 0..filled {
-            let frac = i as f32 / bw as f32;
-            let color = if frac < 0.6 {
-                gfx::OK
-            } else if frac < 0.85 {
-                gfx::WARN
-            } else {
-                gfx::ERR
-            };
-            c.rect(bx + i, by + 4, 1, bh - 8, color);
-        }
-        let mut ml: heapless::String<24> = heapless::String::new();
-        let _ = write!(ml, "{:3}%", (st.mic_level * 100.0) as u32);
-        c.text(bx + bw + 10, by + bh / 2, &ml, gfx::TEXT, 1);
-        d.push(r).ok();
+    if (340..=387).contains(&y) {
+        return match x {
+            20..=183 => Some(Command::Record),
+            192..=355 => Some(Command::Replay),
+            364..=527 => Some(Command::Refresh),
+            _ => None,
+        };
     }
+    None
+}
+fn page_audio_static(c: &mut Canvas, st: &AppStatus) {
+    Card::new(
+        8,
+        CONTENT_Y,
+        784,
+        384,
+        c,
+        "SD player / microphone recorder (ES8389)",
+    );
+    c.text(
+        20,
+        124,
+        "SD root: MP3 + integer PCM WAV (mono / stereo)",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        20,
+        252,
+        "Touch a control; SET starts / stops recording",
+        gfx::MUTED,
+        1,
+    );
+    for (x, y, w, label) in [
+        (20, 280, 120, "PREVIOUS"),
+        (148, 280, 120, "NEXT"),
+        (276, 280, 120, "PLAY"),
+        (404, 280, 120, "STOP"),
+        (20, 340, 164, "RECORD / SAVE"),
+        (192, 340, 164, "REPLAY LAST"),
+        (364, 340, 164, "RESCAN SD"),
+    ] {
+        c.rect(x, y, w, 48, gfx::PANEL_HI);
+        c.text(x + 10, y + 18, label, gfx::ACCENT, 1);
+    }
+    c.text(
+        20,
+        414,
+        "Recording: 48 kHz stereo WAV; STOP saves. VOL+- adjusts speaker.",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        20,
+        438,
+        "Stop recording before removing SD or turning off power.",
+        gfx::MUTED,
+        1,
+    );
+    let mut id:heapless::String<32>=heapless::String::new();let _=write!(id,"codec {:02X}:{:02X}",st.codec_id.0,st.codec_id.1);c.text(604,124,&id,gfx::MUTED,1);
+}
+fn page_audio_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
+    let card = Card::at(8, CONTENT_Y, 784, 384);
+    let r = card.begin_dyn(c, 6, 56, 768, 100);
+    c.text(20, 150, &st.media_name, gfx::ACCENT, 2);
+    c.text(
+        20,
+        180,
+        &st.media_status,
+        if st.recording { gfx::WARN } else { gfx::TEXT },
+        1,
+    );
+    let mut line: heapless::String<96> = heapless::String::new();
+    let source = match st.audio_source {
+        audio::Source::File => "SD",
+        audio::Source::Silence => "idle",
+        audio::Source::Chime => "chime",
+        audio::Source::Tone(_) => "tone",
+    };
+    let _ = write!(
+        line,
+        "{} tracks   {} s   {}   volume {:+.0} dB",
+        st.media_count, st.media_seconds, source, st.volume_db
+    );
+    c.text(20, 202, &line, gfx::TEXT, 1);
+    c.text(20, 222, "MIC", gfx::MUTED, 1);
+    c.bar(62, 220, 460, 14, st.mic_level.min(1.0), gfx::OK);
+    let mut level: heapless::String<24> = heapless::String::new();
+    let _ = write!(level, "RMS {:.1}%", st.mic_level * 100.0);
+    c.text(544, 222, &level, gfx::MUTED, 1);
+    d.push(r).ok();
 }
 
 // ---------------------------------------------------------------- STORAGE
@@ -534,10 +557,10 @@ fn page_storage_static(c: &mut Canvas, st: &AppStatus) {
             c.text(info.x + 12, info.y + 58, &s2, gfx::MUTED, 1);
         }
     }
-    c.text(info.x + 12, info.y + 116, "read-only demo: the card is never written", gfx::MUTED, 1);
+    c.text(info.x + 12, info.y + 116, "AUDIO: play MP3/WAV and save new microphone WAV files", gfx::MUTED, 1);
 
     let y2 = y + 148;
-    let list = Card::new(8, y2, 380, 480 - y2 - 8, c, "Root directory");
+    let list = Card::new(8, y2, 380, 480 - y2 - 8, c, "Root directory (at boot)");
     if let Some(r) = rep {
         if r.entries.is_empty() {
             let mut s: heapless::String<64> = heapless::String::new();

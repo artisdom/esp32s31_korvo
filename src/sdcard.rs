@@ -2,10 +2,9 @@
 //!
 //! The esp-hal SDMMC slot implements the async `sdio::MmcBus` protocol;
 //! the `sdio` crate turns it into a `block_device_driver::BlockDevice`.
-//! On top of that we do a *read-only* FAT inspection: partition type,
-//! FAT type + volume label from the boot sector, root-directory listing,
-//! and a short preview of the first text file found. The demo never
-//! writes to user media.
+//! Boot inspection shows card information and a root listing. The same native
+//! block device is then handed to the FAT media layer for playback and creation
+//! of new recordings; existing files are never opened for writing.
 
 use aligned::Aligned;
 use esp_hal::{
@@ -47,7 +46,7 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
-type CardDevice = sdio::DefaultBlockDevice<
+pub(crate) type CardDevice = sdio::DefaultBlockDevice<
     sdio::sd::Card,
     esp_hal::sdmmc::Slot<'static, 0, esp_hal::Async>,
     embassy_time::Delay,
@@ -57,7 +56,7 @@ pub async fn mount_and_inspect(
     sdhost: esp_hal::peripherals::SDHOST<'static>,
     pins: SdPins,
     mut power: Output<'static>,
-) -> SdReport {
+) -> (SdReport, Option<&'static mut CardDevice>) {
     let mut report = SdReport {
         card_ok: false,
         capacity_mb: 0,
@@ -80,7 +79,7 @@ pub async fn mount_and_inspect(
         Ok(c) => CTRL.init(c),
         Err(_) => {
             report.error = Some("host clock");
-            return report;
+            return (report, None);
         }
     };
 
@@ -88,7 +87,7 @@ pub async fn mount_and_inspect(
         Ok(s) => s,
         Err(_) => {
             report.error = Some("slot");
-            return report;
+            return (report, None);
         }
     };
 
@@ -102,19 +101,15 @@ pub async fn mount_and_inspect(
         .into_async();
 
     static DEVICE: StaticCell<CardDevice> = StaticCell::new();
-    let device = match sdio::DefaultBlockDevice::new_sd_card(
-        slot,
-        20_000_000,
-        embassy_time::Delay {},
-    )
-    .await
-    {
-        Ok(d) => DEVICE.init(d),
-        Err(_) => {
-            report.error = Some("no card");
-            return report;
-        }
-    };
+    let device =
+        match sdio::DefaultBlockDevice::new_sd_card(slot, 20_000_000, embassy_time::Delay {}).await
+        {
+            Ok(d) => DEVICE.init(d),
+            Err(_) => {
+                report.error = Some("no card");
+                return (report, None);
+            }
+        };
 
     report.card_ok = true;
     let card = device.card();
@@ -125,10 +120,13 @@ pub async fn mount_and_inspect(
     if let Err(e) = inspect_filesystem(device, &mut report).await {
         report.error = Some(e);
     }
-    report
+    (report, Some(device))
 }
 
-async fn inspect_filesystem(dev: &mut CardDevice, report: &mut SdReport) -> Result<(), &'static str> {
+async fn inspect_filesystem(
+    dev: &mut CardDevice,
+    report: &mut SdReport,
+) -> Result<(), &'static str> {
     let mut block0: Aligned<aligned::A4, [u8; BLOCK]> = aligned::Aligned([0u8; BLOCK]);
     read(dev, 0, &mut block0).await?;
     let b: &[u8] = &block0[..];
@@ -185,9 +183,16 @@ async fn inspect_filesystem(dev: &mut CardDevice, report: &mut SdReport) -> Resu
     }
 
     let total_sectors = if total16 != 0 { total16 } else { total32 };
-    let fat_sectors = if fat16_sectors != 0 { fat16_sectors } else { fat32_sectors };
+    let fat_sectors = if fat16_sectors != 0 {
+        fat16_sectors
+    } else {
+        fat32_sectors
+    };
     let is_fat32 = fat16_sectors == 0 && fat32_sectors != 0;
-    report.fs_type.push_str(if is_fat32 { "FAT32" } else { "FAT16" }).ok();
+    report
+        .fs_type
+        .push_str(if is_fat32 { "FAT32" } else { "FAT16" })
+        .ok();
 
     // Volume label: root-dir copy if present, else boot-sector copy.
     let mut label_from_root = false;
@@ -312,20 +317,15 @@ fn parse_dir_block(block: &[u8], out: &mut heapless::Vec<DirEntry, 10>) {
                 name.push(c as char).ok();
             }
         }
-        let cluster =
-            u16::from_le_bytes([e[26], e[27]]) as u32 | (u16::from_le_bytes([e[20], e[21]]) as u32) << 16;
+        let cluster = u16::from_le_bytes([e[26], e[27]]) as u32
+            | (u16::from_le_bytes([e[20], e[21]]) as u32) << 16;
         let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]);
         let is_dir = e[11] & 0x10 != 0;
         if name.ends_with("TXT") {
             LAST_TXT.lock(|c| c.set(Some((1, size, cluster))));
         }
         if out.len() < out.capacity() {
-            out.push(DirEntry {
-                name,
-                size,
-                is_dir,
-            })
-            .ok();
+            out.push(DirEntry { name, size, is_dir }).ok();
         }
         off += 32;
     }
@@ -342,12 +342,7 @@ async fn next_cluster(
         let mut fb: Aligned<aligned::A4, [u8; BLOCK]> = aligned::Aligned([0u8; BLOCK]);
         read(dev, fat_lba + idx as u32, &mut fb).await?;
         let off = (cluster as usize % 128) * 4;
-        Ok(u32::from_le_bytes([
-            fb[off],
-            fb[off + 1],
-            fb[off + 2],
-            fb[off + 3],
-        ]) & 0x0FFF_FFFF)
+        Ok(u32::from_le_bytes([fb[off], fb[off + 1], fb[off + 2], fb[off + 3]]) & 0x0FFF_FFFF)
     } else {
         let idx = cluster as usize / 256;
         let mut fb: Aligned<aligned::A4, [u8; BLOCK]> = aligned::Aligned([0u8; BLOCK]);

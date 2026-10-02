@@ -3,13 +3,12 @@
 //!
 //! The codec is an I2S slave sharing one BCLK/LRCLK pair for both
 //! directions. The TX unit generates those clocks; the RX unit runs as
-//! master off its own divider (same root clock, same ratio), mirroring
-//! what the stock driver achieves with a shared-clock full-duplex channel.
+//! slave from the TX clock signals through the hardware clock loopback.
 
 use esp_hal::{
     gpio::InputSignal,
-    peripherals::{GPIO2, GPIO3, GPIO4, GPIO5, GPIO6},
     i2s::master::{Channels, DataFormat, I2s, TdmConfig},
+    peripherals::{GPIO2, GPIO3, GPIO4, GPIO5, GPIO6},
     time::Rate,
 };
 
@@ -25,16 +24,17 @@ pub fn build_i2s(
     let config = TdmConfig::new_tdm_philips()
         .with_sample_rate(Rate::from_hz(b::AUDIO_SAMPLE_RATE))
         .with_data_format(DataFormat::Data16Channel16)
-        .with_channels(Channels::STEREO);
+        .with_channels(Channels::STEREO)
+        .with_signal_loopback(true);
     let i2s = I2s::new(i2s0, dma, config).map_err(|_| "I2S config")?;
     Ok(i2s.with_mclk(mclk))
 }
 
 /// ~100 ms of stereo 16-bit @ 48 kHz.
-const TX_STREAM_LEN: usize = 48000 / 10 * 4;
-const TX_CHUNK: usize = 1024;
-const RX_STREAM_LEN: usize = 48000 / 10 * 4;
-const RX_CHUNK: usize = 1024;
+
+const TX_CHUNK: usize = 8192;
+
+const RX_CHUNK: usize = 8192;
 
 /// 256-entry sine table (Bhaskara approximation, ~1.6% max error — fine
 /// for a demonstration tone).
@@ -66,6 +66,7 @@ pub enum Source {
     Tone(f32),
     /// Short startup arpeggio; falls back to [`Source::Silence`].
     Chime,
+    File,
 }
 
 pub struct Audio {
@@ -83,10 +84,16 @@ pub struct Audio {
     mic_scratch: [u8; RX_CHUNK],
 }
 
-type TxTransfer =
-    esp_hal::i2s::master::I2sTxDmaTransfer<'static, esp_hal::Blocking, esp_hal::dma::DmaTxStreamBuf>;
-type RxTransfer =
-    esp_hal::i2s::master::I2sRxDmaTransfer<'static, esp_hal::Blocking, esp_hal::dma::DmaRxStreamBuf>;
+type TxTransfer = esp_hal::i2s::master::I2sTxDmaTransfer<
+    'static,
+    esp_hal::Blocking,
+    crate::audio_ring::Ring<false>,
+>;
+type RxTransfer = esp_hal::i2s::master::I2sRxDmaTransfer<
+    'static,
+    esp_hal::Blocking,
+    crate::audio_ring::Ring<true>,
+>;
 
 pub struct AudioPins {
     pub bclk: GPIO3<'static>,
@@ -96,7 +103,10 @@ pub struct AudioPins {
 }
 
 impl Audio {
-    pub fn new(i2s: I2s<'static, esp_hal::Blocking>, pins: AudioPins) -> Result<Self, &'static str> {
+    pub fn new(
+        i2s: I2s<'static, esp_hal::Blocking>,
+        pins: AudioPins,
+    ) -> Result<Self, &'static str> {
         // Loop the wire clocks back into the RX timing inputs so the RX
         // unit can see the same BCLK/WS the codec is timed by. This only
         // touches the input matrix; the TX builder below then drives the
@@ -112,12 +122,27 @@ impl Audio {
             .build();
         let rx = i2s.i2s_rx.with_din(pins.din).build();
 
-        let mut tx_buf = esp_hal::dma_tx_stream_buffer!(TX_STREAM_LEN, TX_CHUNK);
-        // Half-fill so the stream never underruns at the start.
-        tx_buf.push(&[0u8; TX_STREAM_LEN / 2]);
+        let (rx_bytes, rx_desc, tx_bytes, tx_desc) = esp_hal::dma_buffers_chunk_size!(
+            crate::audio_ring::LEN,
+            crate::audio_ring::LEN,
+            crate::audio_ring::CHUNK
+        );
+        let tx_buf = crate::audio_ring::Ring::<false>::new(tx_bytes, tx_desc);
+        let rx_buf = crate::audio_ring::Ring::<true>::new(rx_bytes, rx_desc);
         let tx_transfer = tx.write(tx_buf).map_err(|_| "I2S TX start")?;
-        let rx_buf = esp_hal::dma_rx_stream_buffer!(RX_STREAM_LEN, RX_CHUNK);
         let rx_transfer = rx.read(rx_buf).map_err(|_| "I2S RX start")?;
+        // HAL starts generic RX with 0xfffe (usize::MAX - 1 truncated).
+        // Keep the EOF period a multiple of complete stereo frames and DMA
+        // blocks. This avoids partial descriptor payloads in a fixed-size ring.
+        // 1024 is aligned whether the EOF unit is bytes (IDF helper docs) or
+        // sample words (PAC field docs).
+        let regs = esp_hal::peripherals::I2S0::regs();
+        regs.rx_conf().modify(|_, w| w.rx_start().clear_bit());
+        regs.rxeof_num()
+            .write(|w| unsafe { w.rx_eof_num().bits(crate::audio_ring::CHUNK as u16) });
+        regs.rx_conf().modify(|_, w| w.rx_update().set_bit());
+        while regs.rx_conf().read().rx_update().bit_is_set() {}
+        regs.rx_conf().modify(|_, w| w.rx_start().set_bit());
 
         Ok(Self {
             tx_transfer,
@@ -144,7 +169,7 @@ impl Audio {
                 self.chime_left = 4 * b::AUDIO_SAMPLE_RATE;
                 self.phase_inc = 261.63 / b::AUDIO_SAMPLE_RATE as f32;
             }
-            Source::Silence => {
+            Source::Silence | Source::File => {
                 self.phase_inc = 0.0;
                 self.chime_left = 0;
             }
@@ -156,19 +181,53 @@ impl Audio {
     }
 
     /// Call every loop tick: keeps the DMA fed and the mic meter fresh.
-    pub fn poll(&mut self) {
-        let avail = self.rx_transfer.available_bytes();
+    pub fn free(&mut self) -> usize {
+        self.tx_transfer.available()
+    }
+    pub fn queued(&mut self) -> usize {
+        self.tx_transfer.queued()
+    }
+    pub fn queue(&mut self, bytes: &[u8]) -> usize {
+        self.tx_transfer.push(bytes)
+    }
+
+    pub fn debug_samples(&self) {
+        esp_println::println!("mic samples (left/right):");
+        for frame in self.mic_scratch[..128].chunks_exact(4) {
+            esp_println::println!(
+                "{}/{}",
+                i16::from_le_bytes([frame[0], frame[1]]),
+                i16::from_le_bytes([frame[2], frame[3]])
+            );
+        }
+    }
+    pub fn log_stats(&self) {
+        esp_println::println!(
+            "I2S: TX blocks={} RX blocks={} underruns={} overruns={}",
+            crate::audio_ring::TX_DONE.load(core::sync::atomic::Ordering::Relaxed),
+            crate::audio_ring::RX_DONE.load(core::sync::atomic::Ordering::Relaxed),
+            self.tx_transfer.lost,
+            self.rx_transfer.lost
+        );
+    }
+
+    pub fn poll(&mut self) -> &[u8] {
+        crate::audio_ring::poll_completions();
+        self.tx_transfer.clear_played();
+        let mut captured = 0;
+        let avail = self.rx_transfer.available();
         if avail > 0 {
             let n = self.rx_transfer.pop(&mut self.mic_scratch);
+            captured = n;
             if n >= 8 {
-                let samples = i16_view(&self.mic_scratch[..n]);
+                let samples = &self.mic_scratch[..n];
                 let mut acc: u64 = 0;
                 let mut count = 0u32;
                 let mut mn = i16::MAX;
                 let mut mx = i16::MIN;
                 let mut i = 0;
                 while i + 1 < samples.len() {
-                    let s = samples[i];
+                    let s = i16::from_le_bytes([samples[i], samples[i + 1]]);
                     acc += (s as i32 * s as i32) as u64;
                     count += 1;
                     mn = mn.min(s);
@@ -185,18 +244,24 @@ impl Audio {
             }
         }
 
-        let free = self.tx_transfer.available_bytes();
-        if free >= TX_CHUNK {
+        let free = self.tx_transfer.available();
+        if self.source != Source::File && free >= TX_CHUNK {
             let mut sample_gen = SampleGen {
                 phase: self.phase,
                 phase_inc: self.phase_inc,
                 source: self.source,
                 chime_left: self.chime_left,
             };
-            let _ = self.tx_transfer.push_with(|chunk| sample_gen.fill(chunk));
+            let mut chunk = [0u8; TX_CHUNK];
+            sample_gen.fill(&mut chunk);
+            self.tx_transfer.push(&chunk);
             self.phase = sample_gen.phase;
             self.chime_left = sample_gen.chime_left;
+            if self.source == Source::Chime && self.chime_left == 0 {
+                self.source = Source::Silence;
+            }
         }
+        &self.mic_scratch[..captured]
     }
 }
 
@@ -212,7 +277,6 @@ struct SampleGen {
 impl SampleGen {
     /// Generate stereo samples into `chunk`; returns bytes written.
     fn fill(&mut self, chunk: &mut [u8]) -> usize {
-        let samples = i16_view_mut(chunk);
         let mut written = 0;
 
         if self.chime_left > 0 {
@@ -222,10 +286,8 @@ impl SampleGen {
             self.phase_inc = base / b::AUDIO_SAMPLE_RATE as f32;
         }
 
-        let active = self.source != Source::Silence || self.chime_left > 0;
-        let mut i = 0;
-        while i + 1 < samples.len() {
-            let s = if active {
+        for frame in chunk.chunks_exact_mut(4) {
+            let s = if matches!(self.source, Source::Tone(_)) || self.chime_left > 0 {
                 let idx = (self.phase * 256.0) as usize & 0xff;
                 let raw = SINE[idx] as f32;
                 let v = if self.chime_left > 0 {
@@ -245,9 +307,8 @@ impl SampleGen {
             } else {
                 0
             };
-            samples[i] = s;
-            samples[i + 1] = s;
-            i += 2;
+            frame[..2].copy_from_slice(&s.to_le_bytes());
+            frame[2..].copy_from_slice(&s.to_le_bytes());
             written += 4;
             if self.chime_left > 0 {
                 self.chime_left -= 1;
@@ -255,18 +316,4 @@ impl SampleGen {
         }
         written
     }
-}
-
-#[inline]
-fn i16_view(bytes: &[u8]) -> &[i16] {
-    let n = bytes.len() / 2;
-    // SAFETY: DMA buffers are at least 4-byte aligned and lengths are even.
-    unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const i16, n) }
-}
-
-#[inline]
-fn i16_view_mut(bytes: &mut [u8]) -> &mut [i16] {
-    let n = bytes.len() / 2;
-    // SAFETY: see i16_view.
-    unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut i16, n) }
 }

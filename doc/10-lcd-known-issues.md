@@ -33,16 +33,32 @@ of two for the requested 18 MHz PCLK. Actual LCD VSYNC events give about
 35.4 Hz, consistent with the configured 928×548 total frame timing.
 The original DMA-descriptor counter was unreliable and cannot substantiate
 a physical PCLK measurement. Use a scope or logic analyzer for that.
-The application now counts LCD VSYNC directly and reports inferred PCLK
-using elapsed time.
+The application now counts LCD VSYNC directly. Heartbeat count differences
+over elapsed time can be used to infer refresh rate and PCLK.
 
-## Alignment and legacy calibration
+## Split title: legacy rendering rotation removed
 
-Boot touch calibration remains. Earlier claims that ST7262E43 necessarily
-starts with a random panel phase were hypotheses, not proven explanations.
-FIFO underruns can desynchronize DMA data and the timing generator, so
-alignment must be rechecked with the transfer buffer enabled. A fixed
-calibration offset cannot correct continuing drift.
+After drift stopped, the user reported half the title at the bottom of the
+screen. The last boot calibration recorded touch (404,257) and offsets
+(796,463). The vertical offset wraps rendering upward by 17 rows, splitting
+the title drawn at y=12 between the top and bottom. Earlier buffer-enabled
+boots similarly recorded y offsets of 460 and 463.
+
+Removed the boot crosshair calibration, offset atomics, modulo rendering
+rotation and touch-coordinate transformation. Screen coordinates now map
+directly to framebuffer coordinates and drawing clips at the edges. The
+existing transfer-buffer fix remains enabled. After flashing, the user
+confirmed that the full title and touch tabs align correctly. UART logs
+reported zero underruns through more than 1,400 VSYNC events.
+
+Two host rendering regression checks pass: the title remains within its
+header rows, and edge drawing clips without wrapping to the opposite side.
+Run them with:
+
+```sh
+rustc --edition=2024 --test tests/canvas.rs -o target/canvas-tests
+./target/canvas-tests
+```
 
 Repeated SoC resets and any delayed panel recovery also need validation;
 the previously asserted panel PLL explanation is unverified.

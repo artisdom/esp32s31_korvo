@@ -37,18 +37,12 @@ pub const WARN: Color = rgb565(0xff, 0xc0, 0x3b);
 pub const ERR: Color = rgb565(0xff, 0x5a, 0x66);
 pub const WHITE: Color = rgb565(0xff, 0xff, 0xff);
 
-/// A framebuffer viewport: horizontal slice of the 800x480 panel.
-///
-/// `offset_x/offset_y` shift everything drawn by a fixed amount with
-/// wrap-around: the panel locks to the DPI stream with a random phase on
-/// each boot, so rendering is rotated to match (auto-calibrated at boot
-/// from a touch on the crosshair - see `main.rs`).
+/// A framebuffer canvas using screen coordinates. Drawing clips at the
+/// screen edges; pixels never wrap to the opposite edge.
 pub struct Canvas<'a> {
     pub pixels: &'a mut [Color],
     pub width: usize,
     pub height: usize,
-    pub offset_x: usize,
-    pub offset_y: usize,
 }
 
 impl<'a> Canvas<'a> {
@@ -58,17 +52,13 @@ impl<'a> Canvas<'a> {
             pixels,
             width,
             height,
-            offset_x: 0,
-            offset_y: 0,
         }
     }
 
     #[inline]
     pub fn set(&mut self, x: usize, y: usize, c: Color) {
         if x < self.width && y < self.height {
-            let xx = (x + self.offset_x) % self.width;
-            let yy = (y + self.offset_y) % self.height;
-            self.pixels[yy * self.width + xx] = c;
+            self.pixels[y * self.width + x] = c;
         }
     }
 
@@ -77,21 +67,13 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn rect(&mut self, x: usize, y: usize, w: usize, h: usize, c: Color) {
-        if self.offset_x == 0 && self.offset_y == 0 {
-            let x0 = x.min(self.width);
-            let y0 = y.min(self.height);
-            let x1 = (x + w).min(self.width);
-            let y1 = (y + h).min(self.height);
-            for yy in y0..y1 {
-                let row = &mut self.pixels[yy * self.width + x0..yy * self.width + x1];
-                row.fill(c);
-            }
-        } else {
-            for yy in y..(y + h).min(self.height) {
-                for xx in x..(x + w).min(self.width) {
-                    self.set(xx, yy, c);
-                }
-            }
+        let x0 = x.min(self.width);
+        let y0 = y.min(self.height);
+        let x1 = (x + w).min(self.width);
+        let y1 = (y + h).min(self.height);
+        for yy in y0..y1 {
+            let row = &mut self.pixels[yy * self.width + x0..yy * self.width + x1];
+            row.fill(c);
         }
     }
 
@@ -165,9 +147,7 @@ impl<'a> Canvas<'a> {
                     let x = (cx as i32 + dx).max(0) as usize;
                     let y = (cy as i32 + dy).max(0) as usize;
                     if x < self.width && y < self.height {
-                        let xx = (x + self.offset_x) % self.width;
-                        let yy = (y + self.offset_y) % self.height;
-                        self.pixels[yy * self.width + xx] ^= 0xFFFF;
+                        self.pixels[y * self.width + x] ^= 0xFFFF;
                     }
                 }
             }

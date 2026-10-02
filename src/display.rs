@@ -4,7 +4,7 @@
 //! The S31 LCD transfer buffer must be enabled to absorb bus stalls during
 //! CPU drawing and cache writeback. LCD VSYNC and underrun events provide
 //! timing and starvation diagnostics independently of DMA EOF behaviour.
-//! Boot touch calibration currently remains as a legacy alignment workaround.
+//! Rendering uses screen coordinates directly, without phase calibration.
 
 use esp_hal::{
     dma::{DmaDescriptor, DmaTxBuffer, Preparation, aligned::DmaAlignedMut},
@@ -149,10 +149,7 @@ impl Display {
     pub fn canvas(&mut self) -> Canvas<'_> {
         let ptr = FB_PTR.load(core::sync::atomic::Ordering::Relaxed) as *mut Color;
         let px: &mut [Color] = unsafe { core::slice::from_raw_parts_mut(ptr, FB_LEN / 2) };
-        let mut c = Canvas::new(px, b::LCD_H_RES, b::LCD_V_RES);
-        c.offset_x = crate::CAL_OFFSET_X.load(core::sync::atomic::Ordering::Relaxed);
-        c.offset_y = crate::CAL_OFFSET_Y.load(core::sync::atomic::Ordering::Relaxed);
-        c
+        Canvas::new(px, b::LCD_H_RES, b::LCD_V_RES)
     }
 
     /// Write back the full framebuffer for page changes and full redraws.
@@ -206,9 +203,9 @@ static UNDERRUNS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 
 pub fn log_stats() {
     use core::sync::atomic::Ordering::Relaxed;
-    esp_println::println!("LCD: vsync={} underrun={} transfer_buffer={}",
-        VSYNCS.load(Relaxed), UNDERRUNS.load(Relaxed),
-        esp_hal::peripherals::LCD_CAM::regs().lcd_trans_buff_cfg().read().lcd_trans_buffer_ena().bit());
+    esp_println::println!("LCD: vsync={} underrun={} transfer_buffer={} frame_clocks={}",
+        frame_count(), UNDERRUNS.load(Relaxed),
+        esp_hal::peripherals::LCD_CAM::regs().lcd_trans_buff_cfg().read().lcd_trans_buffer_ena().bit(), pixels_per_frame());
 }
 
 #[esp_hal::ram]

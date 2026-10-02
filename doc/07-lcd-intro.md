@@ -118,8 +118,9 @@ endless ring. `Dpi::send(true, ring)` starts the continuous scan with
 The previous driver exhibited shifting and per-boot offsets with the RGB
 transfer buffer disabled. Those observations do not establish an inherent
 random phase in the ST7262E43. Enabling the buffer stopped the reported
-drift; see [current evidence](10-lcd-known-issues.md). Boot calibration
-remains pending alignment validation.
+drift; see [current evidence](10-lcd-known-issues.md). The boot calibration
+was subsequently removed because its rendering rotation split the title
+across the top and bottom. Rendering now uses screen coordinates directly.
 
 ### Minutes-slow re-lock after SoC reset
 
@@ -127,13 +128,8 @@ If the SoC resets while the panel stays powered, the panel can take
 **minutes** to re-lock to the stream. A cold power-on locks in ~1 second.
 The cause of this earlier observation is unverified; retest after the transfer-buffer fix.
 
-### Boot calibration
+### Rendering coordinates
 
-```
-1. Draw a crosshair at framebuffer (400, 240)
-2. Wait for user to touch the visible crosshair (up to 30 seconds)
-3. Compute offsets: Sx = (touch_x - 400) mod 800
-                    Sy = (touch_y - 240) mod 480
-4. All rendering rotates by (-Sx, -Sy) — Canvas.offset_x/y
-5. Touch coordinates map back with the same offsets
-```
+The demo starts directly on the home page after peripheral setup. Rendering
+and touch use the same coordinates with no boot crosshair, modulo rotation
+or alignment offsets. Drawing clips to the 800×480 screen boundary.

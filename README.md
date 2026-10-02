@@ -37,6 +37,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 
 ## Controls
 
+- The title stays at the top; startup no longer asks for display-phase calibration.
 - **Touch** the tabs to switch pages (HOME / AUDIO / SD CARD / CAMERA / ABOUT).
 - **MODE** cycles pages and toggles a 440 Hz test tone.
 - **SET** replays the startup chime.

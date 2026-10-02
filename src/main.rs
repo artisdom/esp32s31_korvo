@@ -45,11 +45,6 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// Main-loop heartbeat, readable from the USB task on core 1.
 static LOOP_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Legacy fixed alignment offsets measured by boot touch calibration.
-/// These do not compensate for drift; scan-out must avoid underruns.
-static CAL_OFFSET_X: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static CAL_OFFSET_Y: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
 static BOOT_T0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 fn step(msg: &str) {
     let t0 = BOOT_T0.load(Ordering::Relaxed);
@@ -311,13 +306,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
         flash_led: false,
     };
 
-    lcd_calibrate(&mut display, touch.as_mut(), &mut buttons).await;
-
     let start = Instant::now();
     let mut touch_seen = 0u32;
-    // Force a full page draw on the first loop iteration: the calibration
-    // screen is still in the framebuffer, and the loop only repaints
-    // dynamic widgets afterwards.
+    // Replace the splash with a full page before updating dynamic widgets.
     let mut shown_page = if st.page == Page::Home {
         Page::Audio
     } else {
@@ -364,9 +355,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         st.btn_held = buttons.held();
 
         // ---- touch ----
-        // st.touch_point stays in PANEL space (the cursor is drawn
-        // unrotated so it lands under the finger); hit-testing converts
-        // into framebuffer space.
+        // Touch, rendering and dirty regions all use screen coordinates.
         if let Some(t) = touch.as_mut() {
             st.touch_point = t.poll().map(|p| (p.x, p.y));
             if st.touch_point.is_some() && touch_seen < 3 {
@@ -374,8 +363,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 println!("touch: {:?}", st.touch_point);
             }
             if let Some((x, y)) = st.touch_point {
-                let (fx, fy) = touch_to_fb(x, y);
-                if let Some(page) = ui::hit_tabs(fx, fy) {
+                if let Some(page) = ui::hit_tabs(x, y) {
                     st.page = page;
                 }
             }
@@ -444,117 +432,6 @@ async fn main(_spawner: embassy_executor::Spawner) {
 
         Timer::after(Duration::from_millis(2)).await;
     }
-}
-
-/// Legacy boot alignment calibration. Draw a crosshair at (400, 240), ask
-/// the user to touch where it *appears*, and rotate the framebuffer by
-/// the measured delta so subsequent drawing lines up with the glass.
-/// Touch coordinates are panel-space, so the same offsets map them back
-/// into framebuffer space.
-async fn lcd_calibrate(
-    display: &mut display::Display,
-    mut touch: Option<&mut touch::Touch>,
-    buttons: &mut buttons::Buttons,
-) {
-    // Legacy alignment calibration: one draw and one cache writeback.
-    // This measures a fixed offset; it cannot compensate for ongoing drift.
-    {
-        let mut c = display.canvas();
-        c.fill(gfx::WHITE);
-        c.circle(400, 240, 10, gfx::BLACK);
-        c.rect(398, 200, 4, 80, gfx::BLACK);
-        c.rect(360, 238, 80, 4, gfx::BLACK);
-        c.text(280, 40, "touch the crosshair", gfx::BLACK, 1);
-        c.text(248, 60, "to calibrate the display", gfx::BLACK, 1);
-    }
-    display.flush();
-    step("LCD cal: touch the visible crosshair (30 s, or press a button)");
-
-    let cal_start = esp_hal::time::Instant::now();
-    let mut stable: Option<(u16, u16)> = None;
-    let mut stable_count = 0u32;
-    let mut last_dbg = 0u64;
-    let mut last_frames = display::frame_count();
-    let mut last_frame_ms = 0u64;
-
-    while cal_start.elapsed().as_secs() < 30 {
-        // Buttons stay live: any key press skips the calibration.
-        if let Some(btn) = buttons.poll() {
-            println!(
-                "LCD cal: {} pressed (raw={}, {} mV) -> skipping",
-                btn.label(),
-                buttons.last_raw,
-                buttons.last_mv
-            );
-            return;
-        }
-        let t_ms = cal_start.elapsed().as_millis() as u64;
-        if t_ms / 1000 != last_dbg {
-            last_dbg = t_ms / 1000;
-            // Derive timing from actual elapsed milliseconds and LCD VSYNC.
-            let frames = display::frame_count().wrapping_sub(last_frames);
-            last_frames = display::frame_count();
-            let interval_ms = t_ms - last_frame_ms;
-            last_frame_ms = t_ms;
-            let scan_millihz = frames as u64 * 1_000_000 / interval_ms;
-            let inferred_pclk_khz = frames as u64 * display::pixels_per_frame() as u64 / interval_ms;
-            println!(
-                "cal: {} s, scan={}.{:03} Hz (inferred PCLK {} kHz), button raw={} ({} mV)",
-                t_ms / 1000,
-                scan_millihz / 1000,
-                scan_millihz % 1000,
-                inferred_pclk_khz,
-                buttons.last_raw,
-                buttons.last_mv
-            );
-            display::log_stats();
-            if let Some(t) = touch.as_deref_mut() {
-                t.debug_print();
-            }
-        }
-        if let Some(t) = touch.as_deref_mut() {
-            if let Some(p) = t.poll() {
-                let same = stable.is_some_and(|(sx, sy)| {
-                    (sx as i32 - p.x as i32).abs() <= 4 && (sy as i32 - p.y as i32).abs() <= 4
-                });
-                if same {
-                    stable_count += 1;
-                } else {
-                    stable = Some((p.x, p.y));
-                    stable_count = 0;
-                }
-                if stable_count > 20 {
-                    let (tx, ty) = stable.unwrap();
-                    // The crosshair is drawn at FB (400, 240) but appears
-                    // at ((400+Sx)%800, (240+Sy)%480); the touch reports
-                    // the visible (panel) position.
-                    // The panel shows framebuffer index f at glass
-                    // position f + S, so rendering must rotate by -S.
-                    let sx = ((400 - tx as i32).rem_euclid(800)) as usize;
-                    let sy = ((240 - ty as i32).rem_euclid(480)) as usize;
-                    CAL_OFFSET_X.store(sx, Ordering::Relaxed);
-                    CAL_OFFSET_Y.store(sy, Ordering::Relaxed);
-                    println!("LCD cal: touch ({},{}) -> offsets x={} y={}", tx, ty, sx, sy);
-                    return;
-                }
-            } else {
-                stable_count = 0;
-            }
-        }
-        Timer::after(Duration::from_millis(20)).await;
-    }
-    println!("LCD cal: timeout, offsets stay 0");
-}
-
-/// Map a panel-space touch report into framebuffer space using the
-/// calibration offsets.
-fn touch_to_fb(x: u16, y: u16) -> (u16, u16) {
-    let sx = CAL_OFFSET_X.load(Ordering::Relaxed) as i32;
-    let sy = CAL_OFFSET_Y.load(Ordering::Relaxed) as i32;
-    (
-        ((x as i32 - sx).rem_euclid(800)) as u16,
-        ((y as i32 - sy).rem_euclid(480)) as u16,
-    )
 }
 
 /// Allocate the 768000-byte, 64-byte-aligned framebuffer (lands in the

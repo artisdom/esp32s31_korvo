@@ -21,21 +21,29 @@ LCD VSYNC now supplies the refresh measurement; DMA EOF does not.
 Run for an extended period with touch, page changes, audio and USB traffic.
 Check cumulative underruns in the UART heartbeat. Test warm resets and
 cold starts separately. Measure GPIO40 PCLK and sync/DE alignment with a
-scope or logic analyzer; the console PCLK value is inferred from VSYNC.
+scope or logic analyzer; VSYNC counts are not a physical PCLK measurement.
 
-## 2. Remove legacy display-phase calibration when alignment is verified
+## Completed: remove title-wrapping display calibration
 
-Determine whether a fixed offset persists with underruns eliminated.
-Do not assume the panel starts at an inherently random phase. If correct
-scan-out consistently aligns, remove the boot crosshair and rendering
-rotation rather than retaining an unnecessary user calibration step.
+After drift stopped, the title split across the top and bottom. Boot touch
+calibration had set a vertical rendering offset of 463 (equivalent to -17
+rows), wrapping the title around the screen. The crosshair calibration and
+rendering rotation are now removed. Rendering, touch and dirty regions use
+the same screen coordinates; no calibration touch is required at startup.
+The user confirmed correct title and touch-tab alignment after flashing.
 
-## 3. Verify dirty-region writeback under calibration
+## 2. Validate physical alignment
 
-Rendering currently rotates pixels by the calibration offsets. Ensure
-cache writeback covers the actual modified addresses, including wraparound
-and the unrotated touch cursor. Then reduce writeback to the affected
-cache-aligned row spans to avoid unnecessary PSRAM traffic.
+Confirm the complete title stays at the top and touch tabs line up after
+warm and cold starts. If a repeatable touch offset remains, investigate
+the touch controller's coordinate mapping independently of LCD rendering.
+A touch at a crosshair must not rotate the entire framebuffer.
+
+## 3. Optimize dirty-region writeback
+
+There are no rendering offsets to transform. Narrow cache writeback to the
+modified cache-aligned row spans, including the touch cursor, to avoid
+unnecessary PSRAM traffic.
 
 ## 4. Camera capture and display
 

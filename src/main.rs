@@ -48,7 +48,7 @@ mod led;
 mod media;
 mod pcm;
 mod psram_buffer;
-#[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154"))]
+#[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154", feature = "radio-zigbee"))]
 mod radio;
 mod sc101iot_regs;
 mod sdcard;
@@ -117,7 +117,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
     _spawner.spawn(radio::ble_task(peripherals.BT).expect("spawn BLE"));
     #[cfg(feature = "radio-802154")]
     _spawner.spawn(radio::ieee_task(peripherals.IEEE802154).expect("spawn 802.15.4"));
-    #[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154"))]
+    #[cfg(feature = "radio-zigbee")]
+    _spawner.spawn(radio::zigbee_task(peripherals.IEEE802154, peripherals.FLASH).expect("spawn Zigbee"));
+    #[cfg(any(feature = "radio-wifi-ble", feature = "radio-802154", feature = "radio-zigbee"))]
     Timer::after_millis(100).await;
     // --- RGB LCD + PSRAM framebuffer ---------------------------------------------------
     let fb: &'static mut [u8] = alloc_fb().expect("framebuffer alloc");

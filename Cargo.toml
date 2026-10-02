@@ -46,9 +46,22 @@ trouble-host = { version = "0.7", default-features = false, features = ["periphe
 
 ieee802154 = { version = "0.6.1", optional = true }
 
+# Pinned local Zigbee checkout; the tiny S31 port is reproduced in patches/.
+zigbee = { path = "/home/nws/w/esp32/zigbee-rs-s31/zigbee", features = ["storage"], optional = true }
+zigbee-mac = { path = "/home/nws/w/esp32/zigbee-rs-s31/zigbee-mac", features = ["esp32s31"], optional = true }
+esp-storage = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-storage", features = ["esp32s31", "embedded-storage", "bytewise-read"], optional = true }
+embassy-embedded-hal = { version = "0.6", optional = true }
+
+[patch.crates-io]
+esp-hal = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-hal" }
+esp-radio = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-radio" }
+esp-sync = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-sync" }
+esp-alloc = { path = "/home/nws/w/esp32/esp-rs/esp-hal/esp-alloc" }
+
 [features]
 default = []
 radio-wifi-ble = ["dep:esp-radio", "esp-radio/wifi", "esp-radio/ble", "esp-radio/coex", "esp-rtos/esp-radio", "dep:embassy-net", "dep:trouble-host"]
+radio-zigbee = ["dep:zigbee", "dep:zigbee-mac", "dep:esp-storage", "dep:embassy-embedded-hal", "dep:esp-radio", "esp-radio/ieee802154", "esp-rtos/esp-radio"]
 radio-802154 = ["dep:ieee802154", "dep:esp-radio", "esp-radio/ieee802154", "esp-rtos/esp-radio"]
 
 [profile.release]

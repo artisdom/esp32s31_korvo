@@ -1,12 +1,12 @@
 # Optional ESP32-S31 radio demos
 
 The S31 silicon supports 2.4 GHz Wi-Fi 6, Bluetooth 5.4 LE, Bluetooth Classic,
-Zigbee 3.0 and Thread 1.4. The Rust application now has optional Wi-Fi/BLE and
-802.15.4 discovery builds. These are separate from the default media build.
+Zigbee 3.0 and Thread 1.4. The Rust application now has optional Wi-Fi/BLE,
+802.15.4 discovery and experimental Zigbee commissioning builds. These are separate from the default media build.
 Wi-Fi scan/association/DHCP/TCP echo and BLE GATT have now passed hardware
 checks on this board. DHCP is intermittent across resets and remains under
 investigation; Wi-Fi 6 negotiation has not been verified with an AX access point.
-802.15.4 discovery is currently build-tested only.
+802.15.4 discovery and Zigbee commissioning are currently build-tested only.
 
 ## What is implemented
 
@@ -15,7 +15,7 @@ investigation; Wi-Fi 6 negotiation has not been verified with an AX access point
 | Wi-Fi | 2.4 GHz B/G/N/**AX explicitly enabled**, scan with channel/RSSI; optional station connection, DHCP and TCP echo on port 2323 | Hardware scan/association/DHCP/echo passed; intermittent DHCP across resets; AX negotiation needs a compatible access point |
 | Bluetooth LE | Connectable `Korvo-S31` advertising, custom GATT service with readable/notifiable uptime in seconds | Host adapter discovered and connected, read uptime and received five notifications; phone testing remains |
 | IEEE 802.15.4 | Channel 11–26 active discovery, MAC beacon requests, received frame channel/RSSI/LQI; identifies Zigbee PRO beacon extended PAN and capacity | Receive beacons from a nearby coordinator; test TX/RX with a second radio |
-| Zigbee | Zigbee beacon discovery | Full commissioning, security, joining and application clusters are not implemented |
+| Zigbee | Beacon discovery; separate experimental end-device commissioning build with security, persistence, Basic/Identify interview and parent maintenance | Joining/interview/reset must be tested with a real coordinator |
 | Thread | Available 802.15.4 PHY/MAC; no Thread host stack | MLE, 6LoWPAN, IPv6 routing, commissioning and network dataset support are not implemented |
 | Bluetooth Classic | Supported by hardware; unavailable in this application's Rust controller interface | The local esp-radio adapter enables BLE only; Classic controller mode and BR/EDR host/profile stack need implementation |
 
@@ -83,7 +83,7 @@ rustc --edition=2024 --test src/radio_beacon.rs -o /tmp/korvo-beacon-tests
 ## Integration constraints
 
 The current local `esp-radio/build.rs` rejects Wi-Fi and IEEE 802.15.4 enabled
-together, so **choose one radio feature**, never both. Wi-Fi and BLE use the
+together, so **choose one radio feature**, never combine them. Wi-Fi and BLE use the
 upstream coexistence feature. Radio tasks run on the core 0 Embassy executor;
 core 1 remains available for USB and camera compression. Network waits yield,
 and scan reporting yields between access points to avoid a long UART print
@@ -108,7 +108,7 @@ introduce ESP-IDF, C application code, Bluedroid or C++ OpenThread.
 - [Espressif S31 datasheet](https://documentation.espressif.com/esp32-s31_datasheet_en.html): silicon capabilities, including Classic BR/EDR.
 - [esp-radio source](https://github.com/esp-rs/esp-hal/tree/main/esp-radio): current local target support and API. The local S31 BLE adapter in `src/ble/btdm2/os_adapter_esp32s31.rs` selects BLE mode and leaves BR/EDR configuration empty; `src/ble/btdm2/mod.rs` enables BLE explicitly.
 - [TrouBLE](https://github.com/embassy-rs/trouble): Rust BLE host and GATT implementation.
-- [zigbee-rs](https://github.com/zigbee-rs/zigbee-rs): an actual Rust Zigbee stack with discovery and end-device steering examples. Its current ESP adapter targets C6/C5/H2 and older esp-hal/esp-sync APIs; porting it to S31 and verifying secure commissioning is a separate step, not assumed complete by our beacon parser.
+- [zigbee-rs](https://github.com/zigbee-rs/zigbee-rs): an actual Rust Zigbee stack with discovery and end-device steering examples. Its upstream ESP adapter targets C6/C5/H2; our small S31 manifest port and commissioning demo are described below. Secure commissioning still needs board/coordinator validation.
 - [OpenThread](https://github.com/openthread/openthread): a full Thread implementation in C/C++. Wrapping it in Rust would not meet a strict Rust host-stack requirement.
 - [Remade-With-Rust rusty_esp_signal](https://github.com/Remade-With-Rust/rusty_esp_signal): Rust radio application framing/telemetry on existing driver stacks; it does not provide missing Classic or Thread host stacks.
 
@@ -131,3 +131,85 @@ and RX/beacon count) instead of a static radio claim.
 
 No Zigbee coordinator or Thread border router is available, so commissioning
 and real mesh interoperability require a later peer-based hardware check.
+
+## Zigbee commissioning build
+
+`radio-zigbee` adds a full Rust end-device stack via a pinned `zigbee-rs`
+checkout. It runs network steering, receives the network key, requests Trust
+Center link-key exchange, answers ZDP interview requests, serves Basic and
+Identify clusters on endpoint 1, polls its parent every 500 ms and maintains
+its link/rejoins. It resumes the stored network across resets. Keys and frame
+counters are persisted in a reserved flash partition, and keys are never
+printed. This commissioning path is **build-tested, not yet joined to a real
+coordinator on this board**. It is an experimental stack, not a Zigbee-certified
+product; interoperability must be checked with your coordinator.
+
+The tiny S31 adapter port changes only the upstream MAC manifest: adds the
+`esp32s31` feature and matches the local esp-hal/esp-radio/esp-sync/esp-alloc
+versions. The checkout is `/home/nws/w/esp32/zigbee-rs-s31`, upstream revision
+`3c2d51c5ee18893e0e5bc4201e70a6358961708f`, local port commit `d912ad8`.
+`patches/zigbee-rs-s31.patch` records the exact port, and
+`scripts/setup-zigbee-s31.sh` reproduces it in a fresh environment. No shared
+esp-hal checkout is modified by this port.
+
+Use the coordinator's **extended PAN ID**, not its short 16-bit PAN ID. Set the
+actual channel, enable joining on the coordinator, then build:
+
+```sh
+KORVO_ZIGBEE_EPID='your-16-hex-digit-extended-pan' KORVO_ZIGBEE_CHANNEL=15 \
+  cargo build --release --features radio-zigbee
+```
+
+An absent/invalid extended PAN ID or a channel outside 11–26 leaves the stack
+off and logs the configuration error. `radio-zigbee` cannot be combined with
+`radio-wifi-ble` or `radio-802154` because they would own the same modem.
+
+The supplied `partitions-radio.csv` reserves the last 64 KiB of the board's
+16 MiB flash for Zigbee state (`zigbee`, data subtype 0x40, offset `0xff0000`).
+The factory image is restricted below that region. Flash that table together
+with the configured image:
+
+```sh
+espflash flash --port /dev/ttyUSB0 --baud 921600 --flash-size 16mb \
+  --partition-table partitions-radio.csv \
+  target/riscv32imafc-unknown-none-elf/release/korvo-demo
+```
+
+Before any persistence access, firmware checks detected flash capacity and
+the actual partition table at `0x8000`. It requires the exact dedicated
+partition and rejects other partitions overlapping it. An ordinary default
+partition table therefore cannot cause writes to an assumed spare address.
+Subsequent media builds may keep this table when flashing to preserve state.
+
+The endpoint advertises a Home Automation combined interface with model
+`korvo-s31.demo` and manufacturer `Rust Korvo`. It serves Basic and Identify,
+not a fabricated temperature measurement or a physical light. Identify is
+reported on UART; the status LED remains disabled. Coordinators such as
+Zigbee2MQTT may need a custom converter to expose an unfamiliar model even
+after successful commissioning/interview.
+
+Test commissioning, complete interview, Identify, a reset/rejoin, and loss /
+restoration of the parent. Check microphone overruns during key persistence
+and under simultaneous camera/SD recording. The upstream flash driver can
+pause execution while erasing/writing, so uninterrupted capture during those
+operations remains a hardware validation requirement.
+
+Flash partition validation checks:
+
+```sh
+rustc --edition=2024 --test src/zigbee_partition.rs -o /tmp/korvo-zigbee-partition-tests
+/tmp/korvo-zigbee-partition-tests
+```
+
+Thread research found maintained Rust OpenThread bindings in
+[esp-rs/openthread](https://github.com/esp-rs/openthread), which still link the
+C++ OpenThread host, and a Rust commissioner in
+[meshcop-rs](https://github.com/mtilchen/meshcop-rs), which configures networks
+but is not an on-chip MLE/6LoWPAN/IPv6 Thread node stack. Neither supplies a
+complete pure Rust Thread stack for this board. This remains unimplemented.
+
+Validation of the commissioning integration: configured and unconfigured S31
+release builds compile/link; all 344 upstream Zigbee workspace host tests pass;
+two dedicated partition guard tests reject overlaps, missing/duplicate entries,
+incorrect partition types and overflowing ranges. These checks do not replace
+a coordinator commissioning/interview test.

@@ -1,0 +1,33 @@
+diff --git a/zigbee-mac/Cargo.toml b/zigbee-mac/Cargo.toml
+index 617624e..af1f581 100644
+--- a/zigbee-mac/Cargo.toml
++++ b/zigbee-mac/Cargo.toml
+@@ -20,10 +20,10 @@ ieee802154 = "0.6.1"
+ thiserror = { version = "2.0.6", default-features = false }
+ byte = "0.2.7"
+ 
+-esp-sync = { version = "0.2.1", optional = true }
+-esp-alloc = { version = "0.10.0", optional = true }
+-esp-hal = { version = "1.1.0", features = ["rt", "unstable"], default-features = false, optional = true }
+-esp-radio = { version = "1.0.0-beta.0", features = ["ieee802154", "unstable"], default-features = false, optional = true }
++esp-sync = { version = "0.3.0", optional = true }
++esp-alloc = { version = "0.11.0", optional = true }
++esp-hal = { version = "1.2.0", features = ["rt", "unstable"], default-features = false, optional = true }
++esp-radio = { version = "1.0.0-beta.2", features = ["ieee802154", "unstable"], default-features = false, optional = true }
+ 
+ embassy-sync = { version = "0.8", optional = true }
+ embassy-time = { version = "0.5", optional = true }
+@@ -47,6 +47,13 @@ esp = [
+     "dep:embassy-time",
+     "dep:embassy-futures",
+ ]
++esp32s31 = [
++    "esp",
++    "esp-radio/esp32s31",
++    "esp-hal/esp32s31",
++    "esp-alloc/esp32s31",
++    "esp-sync/esp32s31",
++]
+ esp32c6 = [
+     "esp",
+     "esp-radio/esp32c6",

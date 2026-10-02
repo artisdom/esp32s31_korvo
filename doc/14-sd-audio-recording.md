@@ -85,7 +85,7 @@ collision rejection, existing-file preservation, an unchanged superfloppy
 boot sector, MP3 decoding/resampling, WAV widths/alignment, and rate-conversion
 phase across blocks.
 
-Board checks on 2026-10-02:
+Board checks on 2026-10-03 (Pacific/Auckland):
 
 - Native SDMMC mounted the 128 GB FAT32 card for media file access.
 - Created/reopened numbered WAV recordings; a ten-second test saved
@@ -97,3 +97,8 @@ Board checks on 2026-10-02:
   and file boundaries; clocks continued and played blocks cleared to silence.
 - The user confirmed the earlier chime was audible but too loud, prompting
   silent startup and the -30 dB default. Speech quality validation is pending.
+
+Final committed firmware `3c5eafd` was flashed after USB reconnection. Startup
+confirmed the codec, touch, and 128 GB FAT32 card; RX and LCD overrun counts
+remained zero. Microphone levels varied between runs and sometimes reached
+clipping, so intelligible speech playback still needs user confirmation.

@@ -1,5 +1,5 @@
 //! I2S audio path: ES8389 playback (I2S0 TX, DMA streaming) and dual-mic
-//! capture (I2S0 RX), 48 kHz / 16-bit / stereo, SoC as clock master.
+//! capture (I2S0 RX), 48 kHz / PCM16 stereo in 32-bit wire slots, SoC as clock master.
 //!
 //! The codec is an I2S slave sharing one BCLK/LRCLK pair for both
 //! directions. The TX unit generates those clocks; the RX unit runs as
@@ -27,6 +27,33 @@ pub fn build_i2s(
         .with_channels(Channels::STEREO)
         .with_signal_loopback(true);
     let i2s = I2s::new(i2s0, dma, config).map_err(|_| "I2S config")?;
+    // Keep PCM16 in DMA but use 32-bit wire slots: BCLK = 64 * 48 kHz.
+    // The current S31 HAL derives BCLK and WS from data width, and swaps
+    // data/slot register widths for mixed formats. Apply the standard-slot
+    // settings from IDF's S31 i2s_ll_* helpers explicitly before DMA starts.
+    // MCLK remains 256 * Fs; BCLK divides it by four (register stores N-1).
+    let regs = esp_hal::peripherals::I2S0::regs();
+    regs.tx_conf1().modify(|_, w| unsafe {
+        w.tx_bits_mod().bits(15);
+        w.tx_tdm_chan_bits().bits(31);
+        w.tx_half_sample_bits().bits(31);
+        w.tx_tdm_ws_width().bits(31)
+    });
+    regs.rx_conf1().modify(|_, w| unsafe {
+        w.rx_bits_mod().bits(15);
+        w.rx_tdm_chan_bits().bits(31);
+        w.rx_half_sample_bits().bits(31);
+        w.rx_tdm_ws_width().bits(31)
+    });
+    regs.tx_conf().modify(|_, w| unsafe {
+        w.tx_chan_equal().clear_bit();
+        w.tx_bck_div_num().bits(3);
+        w.tx_update().set_bit()
+    });
+    while regs.tx_conf().read().tx_update().bit_is_set() {}
+    regs.rx_conf()
+        .modify(|_, w| w.rx_mono_fst_vld().clear_bit().rx_update().set_bit());
+    while regs.rx_conf().read().rx_update().bit_is_set() {}
     Ok(i2s.with_mclk(mclk))
 }
 

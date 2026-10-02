@@ -138,19 +138,19 @@ impl Es8389 {
 
         // ---- configuration tail of es8389_open ----
         self.upd(0x01, MASK_MS_MODE, 0x00)?; // slave mode
-        self.upd(0x02, 0xC0, 1 << 6)?; // clock from SCLK (no MCLK)
+        self.upd(0x02, 0xC0, 1 << 6)?; // clock from SCLK
         self.upd(0x02, 0x02, 0x00)?; // MCLK not inverted
         self.wr(0xF0, 0x12)?; // both ADC microphone channels; no DAC reference
         self.upd(0x02, 0x01, 0x00)?; // SCLK not inverted
 
         // ---- es8389_set_fs(48000, 16) ----
-        // Coefficient row {ratio 32, MCLK 1.536 MHz (=SCLK)}:
+        // Coefficient row {ratio 64, clock input 3.072 MHz (=SCLK)}:
         self.wr(0x04, 0x00)?;
-        self.wr(0x05, 0x45)?;
-        self.wr(0x06, 0xA4)?;
-        self.wr(0x07, 0xD0)?;
+        self.wr(0x05, 0x51)?;
+        self.wr(0x06, 0x04)?;
+        self.wr(0x07, 0xC0)?;
         self.wr(0x08, 0x10)?;
-        self.wr(0x09, 0xD1)?;
+        self.wr(0x09, 0xC1)?;
         self.wr(0x0A, 0x80)?;
         self.upd(0x0F, 0xC0, 0x00)?;
         self.wr(0x11, 0x00)?;
@@ -161,7 +161,7 @@ impl Es8389 {
         self.wr(0x41, 0x7F)?;
         self.wr(0x42, 0x7F)?;
         self.upd(0x43, 0x81, 0x00)?;
-        self.upd(0xF0, 0x73, 0x12)?; // 48 kHz / ratio-32 coefficient row
+        self.upd(0xF0, 0x73, 0x12)?; // 48 kHz / ratio-64 coefficient row
         self.wr(0xF1, 0x00)?;
         self.wr(0x16, 0x35)?;
         self.wr(0x18, 0x91)?;
@@ -193,7 +193,8 @@ impl Es8389 {
         self.wr(0x24, 0x6A)?; // ADC input (post-bias)
         self.wr(0x25, 0x0A)?; // PGA
 
-        self.set_pa(true);
+        // The app enables the amplifier only for requested playback.
+        self.set_pa(false);
         Ok(())
     }
 

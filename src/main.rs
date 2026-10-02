@@ -44,6 +44,7 @@ mod pcm;
 mod sdcard;
 mod storage;
 mod touch;
+mod touch_action;
 mod ui;
 mod usb;
 
@@ -214,7 +215,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 let _ = codec.set_volume_db(-30.0);
                 let _ = codec.set_mic_gain(9);
                 let _ = codec.set_adc_mute(false);
-                println!("ES8389 initialized: 48 kHz slave, SCLK-derived clocks");
+                println!("ES8389 initialized: 48 kHz slave, 64-Fs SCLK, PCM16 in 32-bit slots");
                 codec.chip_id().unwrap_or((0, 0))
             }
             Err(()) => {
@@ -343,8 +344,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let mut fps_window = Instant::now();
     let mut fps = 0u32;
     let mut previous_held = None;
-    let mut previous_touch = false;
+    let mut touch_action = touch_action::TouchAction::default();
     let mut console = console::Console::new();
+    let mut speaker_enabled = false;
 
     loop {
         LOOP_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -397,22 +399,26 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 touch_seen += 1;
                 println!("touch: {:?}", st.touch_point);
             }
-            if let Some((x, y)) = st.touch_point {
-                if !previous_touch {
-                    if let Some(page) = ui::hit_tabs(x, y) {
-                        st.page = page;
-                    } else if st.page == Page::Audio {
-                        if let Some(cmd) = ui::hit_audio(x, y) {
-                            media.command(cmd, &mut audio);
-                        }
+            if let Some((x, y)) = touch_action.update(st.touch_point, start.elapsed().as_millis()) {
+                if let Some(page) = ui::hit_tabs(x, y) {
+                    st.page = page;
+                } else if st.page == Page::Audio {
+                    if let Some(cmd) = ui::hit_audio(x, y) {
+                        media.command(cmd, &mut audio);
                     }
                 }
             }
         }
 
-        previous_touch = st.touch_point.is_some();
-
         // ---- audio streaming + SD playback / recording ----
+        // Keep clocks and microphone capture running, but shut down the
+        // class-D amplifier while idle or recording. File playback keeps
+        // Source::File until its queued PCM has drained.
+        let want_speaker = audio.source() != Source::Silence && !media.recording();
+        if want_speaker != speaker_enabled {
+            codec.set_pa(want_speaker);
+            speaker_enabled = want_speaker;
+        }
         media.capture(audio.poll());
         media.poll(&mut audio);
         st.media_name.clear();

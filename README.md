@@ -16,7 +16,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 
 | Feature | Hardware | Driver | Status on this board |
 |---|---|---|---|
-| RGB LCD 800x480 | 16-bit bus, 18 MHz PCLK (35 Hz), framebuffer in PSRAM | `esp_hal::lcd_cam::lcd::dpi` + custom descriptor-ring DMA buffer | **works** — continuous scan-out from PSRAM at the panel's designed 35 Hz |
+| RGB LCD 800x480 | 16-bit bus, 18 MHz PCLK (35 Hz), framebuffer in PSRAM | `esp_hal::lcd_cam::lcd::dpi` + custom descriptor-ring DMA buffer | **works** — RGB transfer buffer enabled; horizontal drift stopped in the 2026-10-02 board check, with zero reported underruns during live updates |
 | Capacitive touch | GT1151 @ I2C 0x14 | this repo (`touch.rs`, 16-bit regs, checksummed reports) | **works** — polled, drives page navigation + cursor |
 | Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | **works** — on-chip synthesized chime/test tone, 48 kHz/16-bit |
 | Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | `esp_hal::i2s` DMA + RMS meter | **partial** — DMA delivers samples; full-duplex clocking of the slave codec is not phase-locked in esp-hal yet, so sample quality is not guaranteed |

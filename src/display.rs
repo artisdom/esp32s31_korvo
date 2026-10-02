@@ -1,13 +1,10 @@
 //! 800x480 RGB (DPI) panel driver: full-frame PSRAM ring.
 //!
-//! The ST7262E43 panel locks to the DPI stream with a random phase each
-//! boot; a touch on the boot crosshair measures it (main.rs). A DMA
-//! descriptor ring over the whole 768 KB PSRAM framebuffer scans
-//! continuously. CPU drawing goes through the cache and reaches the panel
-//! via natural eviction — updates take effect within a few seconds, but
-//! the display is always stable (any explicit cache maintenance or
-//! PSRAM write burst disturbs the LCD DMA stream on this chip and makes
-//! the panel re-lock at a new phase).
+//! A one-frame descriptor ring scans RGB565 pixels from PSRAM continuously.
+//! The S31 LCD transfer buffer must be enabled to absorb bus stalls during
+//! CPU drawing and cache writeback. LCD VSYNC and underrun events provide
+//! timing and starvation diagnostics independently of DMA EOF behaviour.
+//! Boot touch calibration currently remains as a legacy alignment workaround.
 
 use esp_hal::{
     dma::{DmaDescriptor, DmaTxBuffer, Preparation, aligned::DmaAlignedMut},
@@ -93,9 +90,9 @@ impl Display {
             .with_vsync_mode(DelayMode::None)
             .with_output_bit_mode(DelayMode::None);
 
-        let mut dpi = Dpi::new(lcd, channel, config).map_err(|_| "DPI config rejected")?;
+        let dpi = Dpi::new(lcd, channel, config).map_err(|_| "DPI config rejected")?;
 
-        let mut dpi = dpi
+        let dpi = dpi
             .with_vsync(pins.vsync)
             .with_hsync(pins.hsync)
             .with_de(pins.de)
@@ -117,15 +114,27 @@ impl Display {
             .with_data14(pins.d14)
             .with_data15(pins.d15);
 
-        FB_PTR.store(fb.as_ptr() as usize, core::sync::atomic::Ordering::Relaxed);
+        // S31's RGB transfer buffer is disabled at reset. Match
+        // rgb_panel_create() in ESP-IDF: enable it before starting DMA to
+        // absorb PSRAM/cache write bursts instead of losing pixel alignment.
+        esp_hal::peripherals::LCD_CAM::regs().lcd_trans_buff_cfg()
+            .modify(|_, w| w.lcd_trans_buffer_ena().set_bit());
 
-        // Bind the EOF handler for wire mode (esp-hal local patch).
-        {
-            use esp_hal::dma::DmaTxInterrupt;
-            let tx = dpi.tx_channel_mut();
-            tx.set_interrupt_handler_pub(LCD_EOF_HANDLER);
-            tx.listen_out_pub(DmaTxInterrupt::Eof);
-        }
+        // Count LCD timing events separately from DMA descriptor completions.
+        let regs = esp_hal::peripherals::LCD_CAM::regs();
+        regs.lc_dma_int_clr().write(|w| {
+            w.lcd_vsync_int_clr().set_bit();
+            w.lcd_underrun_int_clr().set_bit()
+        });
+        esp_hal::interrupt::bind_handler(esp_hal::peripherals::Interrupt::LCD_CAM, LCD_EVENT_HANDLER);
+        esp_hal::interrupt::enable(esp_hal::peripherals::Interrupt::LCD_CAM,
+            esp_hal::interrupt::Priority::Priority2);
+        regs.lc_dma_int_ena().modify(|_, w| {
+            w.lcd_vsync_int_ena().set_bit();
+            w.lcd_underrun_int_ena().set_bit()
+        });
+
+        FB_PTR.store(fb.as_ptr() as usize, core::sync::atomic::Ordering::Relaxed);
 
         let ring = match unsafe { FrameRing::build((&raw mut DESCRIPTORS).cast(), fb) } {
             Ok(r) => r,
@@ -146,8 +155,7 @@ impl Display {
         c
     }
 
-    /// Clean the whole framebuffer in small chunks. Only for page changes
-    /// and rare full redraws; frequent use disturbs the LCD DMA stream.
+    /// Write back the full framebuffer for page changes and full redraws.
     pub fn flush(&mut self) {
         const CHUNK: usize = 4096;
         let ptr = FB_PTR.load(core::sync::atomic::Ordering::Relaxed) as *mut u8;
@@ -180,19 +188,11 @@ impl Display {
         }
     }
 
-    pub fn service_bounce(&mut self) { /* no-op with full-frame ring */ }
 }
 
-pub fn bounce_stats() -> (usize, usize) { (0, 0) }
-pub fn desc_base() -> usize { 0 }
-
-/// Frames completed since boot (EOF on descriptor 0), and the timestamp of
-/// the previous read, so callers can derive the refresh rate.
-static FRAMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-/// Frame counter and the number of PCLKs per frame (active + blanking).
+/// LCD VSYNC count; DMA EOF is not a reliable frame counter on S31.
 pub fn frame_count() -> usize {
-    FRAMES.load(core::sync::atomic::Ordering::Relaxed)
+    VSYNCS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn pixels_per_frame() -> u32 {
@@ -201,18 +201,32 @@ pub fn pixels_per_frame() -> u32 {
         as u32
 }
 
-extern "C" fn lcd_dma_eof_isr() {
-    // Clear the EOF flag (W1C).
-    esp_hal::peripherals::AXI_GDMA::regs()
-        .out_ch(0)
-        .out_int()
-        .clr()
-        .write(|w| w.out_eof().clear_bit_by_one());
-    FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+static VSYNCS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static UNDERRUNS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn log_stats() {
+    use core::sync::atomic::Ordering::Relaxed;
+    esp_println::println!("LCD: vsync={} underrun={} transfer_buffer={}",
+        VSYNCS.load(Relaxed), UNDERRUNS.load(Relaxed),
+        esp_hal::peripherals::LCD_CAM::regs().lcd_trans_buff_cfg().read().lcd_trans_buffer_ena().bit());
 }
 
-const LCD_EOF_HANDLER: esp_hal::interrupt::InterruptHandler =
-    esp_hal::interrupt::InterruptHandler::new(lcd_dma_eof_isr, esp_hal::interrupt::Priority::Priority2);
+#[esp_hal::ram]
+extern "C" fn lcd_event_isr() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let regs = esp_hal::peripherals::LCD_CAM::regs();
+    let status = regs.lc_dma_int_st().read();
+    // Acknowledge only LCD events: camera shares this peripheral interrupt.
+    regs.lc_dma_int_clr().write(|w| {
+        w.lcd_vsync_int_clr().bit(status.lcd_vsync_int_st().bit());
+        w.lcd_underrun_int_clr().bit(status.lcd_underrun_int_st().bit())
+    });
+    if status.lcd_vsync_int_st().bit() { VSYNCS.fetch_add(1, Relaxed); }
+    if status.lcd_underrun_int_st().bit() { UNDERRUNS.fetch_add(1, Relaxed); }
+}
+
+const LCD_EVENT_HANDLER: esp_hal::interrupt::InterruptHandler =
+    esp_hal::interrupt::InterruptHandler::new(lcd_event_isr, esp_hal::interrupt::Priority::Priority2);
 
 type DpiTransfer =
     esp_hal::lcd_cam::lcd::dpi::DpiTransfer<'static, FrameRing, esp_hal::Blocking>;
@@ -262,9 +276,8 @@ impl FrameRing {
             let d = &mut desc[idx];
             d.set_size(chunk);
             d.set_length(chunk);
-            // Only the first descriptor raises EOF, so the interrupt marks
-            // the start of every frame and `FRAMES` counts frames.
-            d.set_suc_eof(idx == 0);
+            // Scan-out does not need DMA EOF interrupts; use LCD VSYNC.
+            d.set_suc_eof(false);
             d.set_owner(esp_hal::dma::Owner::Dma);
             d.buffer = unsafe { fb.as_mut_ptr().add(offset) };
             d.next = unsafe { ring_base.add(idx + 1) };

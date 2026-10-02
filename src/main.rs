@@ -45,9 +45,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 /// Main-loop heartbeat, readable from the USB task on core 1.
 static LOOP_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Panel phase offsets measured at boot (see the boot calibration):
-/// the ST7262E43 locks to the DPI stream with a random phase on every
-/// power-up, so the framebuffer is rotated by (x, y) to compensate.
+/// Legacy fixed alignment offsets measured by boot touch calibration.
+/// These do not compensate for drift; scan-out must avoid underruns.
 static CAL_OFFSET_X: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static CAL_OFFSET_Y: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -65,16 +64,8 @@ fn step(msg: &str) {
     println!("[{:>5} ms] {}", now - base, msg);
 }
 
-#[embassy_executor::task]
-async fn bounce_task() {
-    // No-op with the full-frame ring; kept for future architectures.
-    loop {
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
-    }
-}
-
 #[esp_hal::main]
-async fn main(spawner: embassy_executor::Spawner) {
+async fn main(_spawner: embassy_executor::Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     step("== ESP32-S31-Korvo-1 Rust demo ==");
@@ -140,10 +131,6 @@ async fn main(spawner: embassy_executor::Spawner) {
         Err(e) => panic!("display init failed: {}", e),
     };
 
-    // Bounce-ring refill task: must run far faster than one ring cycle
-    // (~2.7 ms); writing a segment mid-stream corrupts the picture.
-    spawner.spawn(bounce_task().expect("spawn bounce"));
-    step("bounce task spawned");
     {
         let mut c = display.canvas();
         c.fill(gfx::WHITE);
@@ -444,6 +431,7 @@ async fn main(spawner: embassy_executor::Spawner) {
                 buttons.last_raw,
                 esp_alloc::HEAP.free() / 1024
             );
+            display::log_stats();
         }
         // ---- fps ----
         frame += 1;
@@ -458,8 +446,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     }
 }
 
-/// Boot calibration: the panel locks to the DPI stream with a random
-/// phase each power-up. Draw a crosshair at framebuffer (400, 240), ask
+/// Legacy boot alignment calibration. Draw a crosshair at (400, 240), ask
 /// the user to touch where it *appears*, and rotate the framebuffer by
 /// the measured delta so subsequent drawing lines up with the glass.
 /// Touch coordinates are panel-space, so the same offsets map them back
@@ -469,10 +456,8 @@ async fn lcd_calibrate(
     mut touch: Option<&mut touch::Touch>,
     buttons: &mut buttons::Buttons,
 ) {
-    // Static screen: one draw + one flush. No animation - every cache
-    // clean burst briefly disturbs the LCD DMA stream and shifts the
-    // panel phase horizontally. The crosshair just needs to be visible
-    // and touchable.
+    // Legacy alignment calibration: one draw and one cache writeback.
+    // This measures a fixed offset; it cannot compensate for ongoing drift.
     {
         let mut c = display.canvas();
         c.fill(gfx::WHITE);
@@ -490,6 +475,7 @@ async fn lcd_calibrate(
     let mut stable_count = 0u32;
     let mut last_dbg = 0u64;
     let mut last_frames = display::frame_count();
+    let mut last_frame_ms = 0u64;
 
     while cal_start.elapsed().as_secs() < 30 {
         // Buttons stay live: any key press skips the calibration.
@@ -505,17 +491,23 @@ async fn lcd_calibrate(
         let t_ms = cal_start.elapsed().as_millis() as u64;
         if t_ms / 1000 != last_dbg {
             last_dbg = t_ms / 1000;
-            // frames in the last second -> pixel clock = fps * PCLKs/frame
-            let frames = display::frame_count() - last_frames;
+            // Derive timing from actual elapsed milliseconds and LCD VSYNC.
+            let frames = display::frame_count().wrapping_sub(last_frames);
             last_frames = display::frame_count();
+            let interval_ms = t_ms - last_frame_ms;
+            last_frame_ms = t_ms;
+            let scan_millihz = frames as u64 * 1_000_000 / interval_ms;
+            let inferred_pclk_khz = frames as u64 * display::pixels_per_frame() as u64 / interval_ms;
             println!(
-                "cal: {} s, fps={} (PCLK ~{} MHz), button raw={} ({} mV)",
+                "cal: {} s, scan={}.{:03} Hz (inferred PCLK {} kHz), button raw={} ({} mV)",
                 t_ms / 1000,
-                frames,
-                frames as u32 * display::pixels_per_frame() / 1_000_000,
+                scan_millihz / 1000,
+                scan_millihz % 1000,
+                inferred_pclk_khz,
                 buttons.last_raw,
                 buttons.last_mv
             );
+            display::log_stats();
             if let Some(t) = touch.as_deref_mut() {
                 t.debug_print();
             }

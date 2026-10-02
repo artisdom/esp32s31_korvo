@@ -71,7 +71,7 @@ pub const LCD_V_RES: usize = 480;
 // NOTE: the Korvo S31 BSP's display.h carries different numbers
 // (26 MHz, 1/40/20, 1/10/5) which do NOT lock this panel - the image
 // rolls vertically with a 1-line VSYNC the ST7262E43 can't see.
-/// PCLK request. The S31 clock path produces 2x this (36 MHz actual).
+/// Target PCLK; local esp-hal uses a 36 MHz module clock and divides by 2.
 pub const LCD_PIXEL_CLOCK_HZ: u32 = 18_000_000;
 pub const LCD_HSYNC_PULSE_WIDTH: usize = 40;
 pub const LCD_HSYNC_BACK_PORCH: usize = 40;

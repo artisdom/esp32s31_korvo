@@ -19,14 +19,14 @@ implementation, porting to other boards, or contributing fixes upstream.
 | [08-lcd-debug-journey.md](08-lcd-debug-journey.md) | Chronological debugging log: every experiment and its result |
 | [09-lcd-architecture.md](09-lcd-architecture.md) | Current working architecture + why alternatives failed |
 | [10-lcd-known-issues.md](10-lcd-known-issues.md) | PCLK 2× bug, PSRAM/DMA contention, upstream gaps |
-| [11-lcd-future-work.md](11-lcd-future-work.md) | Concrete improvement roadmap for a fully stable display |
+| [11-lcd-future-work.md](11-lcd-future-work.md) | LCD validation and feature roadmap |
 | [12-upstream-contributions.md](12-upstream-contributions.md) | esp-hal patches made, issues to file, what to send upstream |
 
 ## Quick summary of board features
 
 | Feature | Hardware | Status in this demo |
 |---|---|---|
-| RGB LCD 800×480 | ST7262E43, 16-bit bus, 4.3″ | Working — 18 MHz PCLK / 35 Hz, touch calibration (see 10 for the fixed PCLK 2× bug) |
+| RGB LCD 800×480 | ST7262E43, 16-bit bus, 4.3″ | Working — RGB transfer buffer enabled; drift stopped in board check (see 10 for evidence) |
 | Capacitive touch | GT1151 @ I2C 0x14 | Working |
 | Audio playback | ES8389 codec + 2× NS4150B 3 W PAs | Working (48 kHz synthesized tones) |
 | Mic capture | 2× analog → ES8389 ADC → I2S RX | Working (RMS meter) |

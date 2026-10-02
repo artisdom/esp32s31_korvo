@@ -1,5 +1,13 @@
 # LCD Debug Journey — Chronological Log
 
+> Historical observations and hypotheses below are preserved, not current
+> conclusions. On 2026-10-02 the user confirmed drift remained. Enabling the
+> previously disabled S31 RGB transfer buffer stopped reported underruns,
+> and the user confirmed stationary live updates and tab changes. See
+> [current evidence](10-lcd-known-issues.md). Earlier claims that PSRAM
+> writes necessarily cause drift or that short bounce rings can never work
+> were too broad; the previous experiments did not establish them.
+
 This is the full debugging history, preserved so future work doesn't
 repeat dead ends. Each entry lists what was tried, the observed result,
 and the conclusion.

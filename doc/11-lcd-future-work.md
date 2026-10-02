@@ -1,142 +1,64 @@
 # LCD: Future Work & Improvement Roadmap
 
-Ordered by impact and feasibility. Each item includes the approach,
-estimated difficulty, and what it unlocks.
+Updated 2026-10-02 after reproducing the reported drift.
 
-## 1. Fix the PCLK 2× bug at the register level ⭐ Highest impact
+## Completed: enable the RGB transfer buffer
 
-**Difficulty**: Medium (needs TRM study + register comparison with IDF)
+The clock patch alone did not stop horizontal drift. The missing
+`LCD_TRANS_BUFF_CFG.LCD_TRANS_BUFFER_ENA` initialization was added to
+`Display::new`, following ESP-IDF's `rgb_panel_create()`.
 
-**Approach**: 
-- Boot ESP-IDF's factory demo on the same board
-- Dump `HP_SYS_CLKRST.lcdcam_lcd_ctrl0` register (clock divider + source)
-- Dump `LCD_CAM.lcd_clock` register (PCLK config)
-- Compare with what esp-hal writes
-- Fix the discrepancy in `esp-hal/src/soc/esp32s31/clocks.rs` or
-  `esp-hal/src/lcd_cam/lcd/mod.rs`
+On the connected board, enabling the buffer changed the reported underrun
+count from hundreds during live redraws to zero over more than 1,800
+VSYNC events. The user confirmed that the image stayed stationary while
+live values updated and tabs changed. See [known issues](10-lcd-known-issues.md)
+for evidence and validation limits.
 
-**Unlocks**: Correct 18 MHz PCLK / 35 Hz refresh, halved PSRAM read
-bandwidth (36 MB/s instead of 72 MB/s). This alone might eliminate the
-horizontal drift by giving the LCD DMA FIFO enough headroom to absorb
-small cache write evictions.
+LCD VSYNC now supplies the refresh measurement; DMA EOF does not.
 
-**Notes**: The `equ_sysclk` and `lcd_clkcnt_n` fields likely have
-different meanings on S31 vs S3. The S3 values are documented; the S31
-TRM chapter on LCD_CAM clocking is the authoritative source.
+## 1. Extend hardware validation
 
----
+Run for an extended period with touch, page changes, audio and USB traffic.
+Check cumulative underruns in the UART heartbeat. Test warm resets and
+cold starts separately. Measure GPIO40 PCLK and sync/DE alignment with a
+scope or logic analyzer; the console PCLK value is inferred from VSYNC.
 
-## 2. Uncacheable PSRAM writes for the framebuffer
+## 2. Remove legacy display-phase calibration when alignment is verified
 
-**Difficulty**: Medium (MMU page attribute manipulation)
+Determine whether a fixed offset persists with underruns eliminated.
+Do not assume the panel starts at an inherently random phase. If correct
+scan-out consistently aligns, remove the boot crosshair and rendering
+rotation rather than retaining an unnecessary user calibration step.
 
-**Approach**:
-- Remap the framebuffer's PSRAM pages as uncacheable (write-through)
-  using the S31's MMU page attributes
-- CPU writes go directly to PSRAM in small beats (no cache lines to
-  clean or evict)
-- No cache maintenance needed at all
-- The LCD DMA reads the same PSRAM — writes interleave at the bus
-  transaction level (32-64 bytes), which the FIFO can absorb
+## 3. Verify dirty-region writeback under calibration
 
-**Unlocks**: Dynamic UI updates without display disturbance. The
-framebuffer becomes writable at any time.
+Rendering currently rotates pixels by the calibration offsets. Ensure
+cache writeback covers the actual modified addresses, including wraparound
+and the unrotated touch cursor. Then reduce writeback to the affected
+cache-aligned row spans to avoid unnecessary PSRAM traffic.
 
-**Implementation sketch**:
-```rust
-// After allocating the framebuffer, change its MMU page attributes
-// to disable caching. On S31 this means modifying the page table
-// entries that map the PSRAM virtual address range.
-unsafe {
-    let page_attrs = mmu_get_page_attributes(fb_start);
-    mmu_set_page_attributes(fb_start, fb_len, page_attrs & !CACHEABLE);
-}
-```
+## 4. Camera capture and display
 
-The S31's MMU (same family as P4) supports per-page cacheability
-attributes. The exact register interface is in the TRM's MMU chapter.
+Keep the verified SC101IOT paged SCCB probe and XCLK setup. Port its vendor
+sensor initialization to Rust, configure DVP receive, and add preview.
+Monitor underruns when camera DMA and LCD DMA share PSRAM bandwidth.
 
----
+## 5. GUI and touch polish
 
-## 3. LVGL with dirty-region flushing
+Dynamic widgets already run every 50 ms. Improve interactions and drawing
+only after the alignment/cache checks. Choose Rust GUI components if the
+fully Rust implementation remains a requirement; LVGL would introduce C.
 
-**Difficulty**: Medium (once issues 1-2 are resolved)
+## 6. Radio support
 
-**Approach**: 
-- Integrate LVGL (via `lvgl` Rust crate or the esp-lvgl port)
-- LVGL's built-in dirty-region tracking means only changed areas get
-  redrawn
-- Each frame flush only the dirty rects to PSRAM + clean those rects
-- With uncacheable writes (item 2), no cleaning needed at all
+Check the local esp-radio implementation and current S31 support before
+choosing dependencies for Wi-Fi, BLE or 802.15.4. Do not assume an unreleased
+crate version or that enabling features alone completes board support.
 
-**Unlocks**: Full GUI with buttons, sliders, animations — a proper
-demo experience.
+## Deferred approaches
 
----
-
-## 4. Camera streaming (DVP → LCD)
-
-**Difficulty**: High (needs sensor driver port)
-
-**Approach**:
-- Port the OV3660 or SC101IOT register init table (~2000 lines of
-  vendor C code converted to Rust)
-- Use `esp_hal::lcd_cam::cam` (the DVP receive driver, already available
-  on `main`)
-- Display via direct DMA write to the LCD framebuffer or through a
-  format converter
-
-**Prerequisites**: PCLK fix (item 1) so the PSRAM has bandwidth for
-both the LCD stream and the camera DMA.
-
----
-
-## 5. Wi-Fi / BLE / 802.15.4
-
-**Difficulty**: Low (just dependency update) once esp-radio releases
-
-**Approach**: Wait for `esp-radio` crate to publish esp32s31 support
-(already on their main branch). Then:
-```toml
-esp-radio = { version = "1.0", features = ["esp32s31", "wifi", "ble"] }
-```
-
-Standard embassy-network or BLE examples should work with minimal
-changes.
-
----
-
-## 6. Continuous touch cursor tracking
-
-**Difficulty**: Low (once framebuffer writes are safe)
-
-**Approach**: Poll GT1151 at 20 Hz; draw XOR-ring cursor at each
-position. Requires the framebuffer to be writable without display
-disturbance (items 1-2).
-
----
-
-## 7. ADC fix (buttons)
-
-**Difficulty**: Medium (upstream contribution)
-
-**Approach**: Compare IDF's `esp_adc` component initialization with
-esp-hal's S31 ADC driver at the register level. The vendor BSP's
-`esp32_s31_adc_calibration.c` may hold clues about what's missing.
-
-**File to study**: `esp-dev-kits/examples/esp32-s31-korvo/examples/
-common_components/esp32_s31_korvo/esp32_s31_adc_calibration.c`
-
----
-
-## Priority recommendation
-
-```
-1. PCLK fix          — foundational, fixes bandwidth for everything
-2. Uncacheable PSRAM — unlocks dynamic UI
-3. LVGL              — polish (depends on 1+2)
-4. Camera            — flashy demo feature (depends on 1)
-5. Wi-Fi             — easy once esp-radio ships
-6. Touch cursor      — polish (depends on 2)
-7. ADC / buttons     — upstream contribution
-```
+Uncacheable framebuffer mappings and SRAM bounce buffers are not required
+for the observed drift fix. Revisit them only if measured bandwidth or
+latency under additional workloads warrants it. Uncacheable and
+write-through mappings are different cache policies; neither guarantees
+that DMA underruns cannot occur.

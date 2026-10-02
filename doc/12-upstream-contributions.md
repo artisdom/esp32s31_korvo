@@ -1,3 +1,11 @@
+> Updated 2026-10-02: the issue proposals below include historical hypotheses.
+> LCD DMA EOF rates were not reliable PCLK evidence; the application now
+> counts LCD VSYNC. Enabling the missing RGB transfer buffer stopped LCD
+> underruns and user-observed drift. An upstream DPI initialization fix
+> should enable that buffer for S31. Claims of consumed EOF flags and
+> missing ADC initialization below are not established bugs (raw zero is
+> valid button idle). See [current evidence](10-lcd-known-issues.md).
+
 # Upstream Contributions & Issues to File
 
 This document lists everything discovered that should be contributed

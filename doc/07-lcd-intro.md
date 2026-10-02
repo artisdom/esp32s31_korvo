@@ -113,25 +113,25 @@ The last descriptor's `next` pointer wraps to the first, creating an
 endless ring. `Dpi::send(true, ring)` starts the continuous scan with
 `lcd_next_frame_en = 1`.
 
-## Panel behavior quirks
+## Alignment observations
 
-### Random per-boot phase
-
-The ST7262E43 locks to the DPI stream with a **random phase each boot**.
-The image appears shifted by a random (x, y) offset. A boot calibration
-(see below) measures the offset from a single touch.
+The previous driver exhibited shifting and per-boot offsets with the RGB
+transfer buffer disabled. Those observations do not establish an inherent
+random phase in the ST7262E43. Enabling the buffer stopped the reported
+drift; see [current evidence](10-lcd-known-issues.md). Boot calibration
+remains pending alignment validation.
 
 ### Minutes-slow re-lock after SoC reset
 
 If the SoC resets while the panel stays powered, the panel can take
 **minutes** to re-lock to the stream. A cold power-on locks in ~1 second.
-This is a panel behavior, not a SoC issue.
+The cause of this earlier observation is unverified; retest after the transfer-buffer fix.
 
 ### Boot calibration
 
 ```
 1. Draw a crosshair at framebuffer (400, 240)
-2. Wait for user to touch the visible crosshair (up to 5 min)
+2. Wait for user to touch the visible crosshair (up to 30 seconds)
 3. Compute offsets: Sx = (touch_x - 400) mod 800
                     Sy = (touch_y - 240) mod 480
 4. All rendering rotates by (-Sx, -Sy) — Canvas.offset_x/y

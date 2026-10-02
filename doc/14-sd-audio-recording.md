@@ -168,3 +168,12 @@ The media host suite now has 12 passing tests, including FAT16/FAT32 deletion,
 empty/single/multiple cluster files, sector-spanning long names, open-file
 rejection, preserved neighboring files and boot sectors, and clean read-only
 filesystem checks. Physical UI confirmation is pending.
+
+Firmware `8907271` was flashed to `/dev/ttyUSB0`. On-board console checks
+created and removed two disposable `REC00047.WAV` recordings (the unused
+highest number was reused after deletion), once through each selection path.
+Both paths showed the exact filename, honored CANCEL, ignored a subsequent
+confirmation without a pending request, deleted only the newly created test
+file, refreshed the browser and invalidated REPLAY LAST. Existing recordings
+and demo files were preserved. LCD underruns and microphone overruns stayed
+zero throughout. Touch-screen confirmation in both tabs remains pending.

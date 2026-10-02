@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 [dependencies]
-embedded-sdmmc = {version="0.10",default-features=false}
+embedded-sdmmc = { path = "../../vendor/embedded-sdmmc", default-features = false }
 nanomp3-core = {version="0.2",default-features=false}

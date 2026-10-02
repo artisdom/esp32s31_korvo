@@ -1,3 +1,5 @@
+#[path = "../../../src/delete_request.rs"]
+mod delete_request;
 #[path = "../../../src/fat_layout.rs"]
 mod fat_layout;
 #[path = "../../../src/pcm.rs"]
@@ -138,6 +140,132 @@ mod integration {
         f.read_exact(&mut after).unwrap();
         assert_eq!(boot, after);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn deletion_releases_all_clusters_and_lfn_slots_on_fat16_and_fat32() {
+        for bits in [16, 32] {
+            let base =
+                std::env::temp_dir().join(format!("korvo-delete-{}-{}", std::process::id(), bits));
+            let path = base.with_extension("img");
+            let payload = base.with_extension("bin");
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            f.set_len(64 * 1024 * 1024).unwrap();
+            assert!(
+                Command::new("mkfs.fat")
+                    .args(["-F", &bits.to_string()])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::fs::write(&payload, vec![0x5a; 65536]).unwrap();
+            // Fourteen short entries place the LFN run across a sector boundary.
+            for i in 0..14 {
+                assert!(
+                    Command::new("mcopy")
+                        .arg("-i")
+                        .arg(&path)
+                        .arg(&payload)
+                        .arg(format!("::KEEP{:02}.BIN", i))
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let long = "A long microphone recording filename crossing a directory sector.wav";
+            assert!(
+                Command::new("mcopy")
+                    .arg("-i")
+                    .arg(&path)
+                    .arg(&payload)
+                    .arg(format!("::{}", long))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut boot = [0u8; 512];
+            f.read_exact(&mut boot).unwrap();
+            let layout = fat_layout::Layout::detect(&boot, 64 * 1024 * 1024 / 512);
+            let fs = VolumeManager::new(
+                Disk {
+                    file: RefCell::new(f),
+                    layout,
+                },
+                Clock,
+            );
+            let v = fs.open_raw_volume(VolumeIdx(0)).unwrap();
+            let root = fs.open_root_dir(v).unwrap();
+            let mut target = None;
+            fs.iterate_dir(root, |entry| {
+                let name = entry.name.to_string();
+                if name.ends_with(".WAV") {
+                    target = Some(name);
+                }
+                core::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+            let target = target.unwrap();
+            let opened = fs
+                .open_file_in_dir(root, target.as_str(), Mode::ReadOnly)
+                .unwrap();
+            assert!(matches!(
+                fs.delete_entry_in_dir(root, target.as_str()),
+                Err(Error::FileAlreadyOpen)
+            ));
+            fs.close_file(opened).unwrap();
+            fs.delete_entry_in_dir(root, target.as_str()).unwrap();
+            assert!(matches!(
+                fs.find_directory_entry(root, target.as_str()),
+                Err(Error::NotFound)
+            ));
+            for i in 0..14 {
+                let kept = fs
+                    .open_file_in_dir(root, format!("KEEP{:02}.BIN", i).as_str(), Mode::ReadOnly)
+                    .unwrap();
+                assert_eq!(fs.file_length(kept).unwrap(), 65536);
+                let mut sample = [0; 512];
+                fs.read(kept, &mut sample).unwrap();
+                assert_eq!(sample, [0x5a; 512]);
+                fs.close_file(kept).unwrap();
+            }
+            for (name, data) in [("EMPTY.TXT", &b""[..]), ("ONE.TXT", &b"one cluster"[..])] {
+                let file = fs
+                    .open_file_in_dir(root, name, Mode::ReadWriteCreate)
+                    .unwrap();
+                fs.write(file, data).unwrap();
+                fs.close_file(file).unwrap();
+                fs.delete_entry_in_dir(root, name).unwrap();
+                assert!(matches!(
+                    fs.find_directory_entry(root, name),
+                    Err(Error::NotFound)
+                ));
+            }
+            fs.close_dir(root).unwrap();
+            fs.close_volume(v).unwrap();
+            drop(fs);
+            let mut after = [0; 512];
+            File::open(&path).unwrap().read_exact(&mut after).unwrap();
+            assert_eq!(boot, after);
+            // fsck catches orphan LFN slots, leaked chains, inconsistent mirrors
+            // and stale FAT32 free-space accounting. Read-only inspection.
+            let check = Command::new("fsck.fat")
+                .arg("-n")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{}",
+                String::from_utf8_lossy(&check.stdout)
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_file(&payload).unwrap();
+        }
     }
     #[test]
     fn mp3_fixture_decodes_and_resamples_to_48khz_stereo() {

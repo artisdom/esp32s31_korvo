@@ -58,6 +58,10 @@ pub struct AppStatus {
     pub media_status: heapless::String<64>,
     pub media_seconds: u32,
     pub media_count: usize,
+    pub sd_file_name: crate::storage::Name,
+    pub sd_file_count: usize,
+    pub sd_file_index: usize,
+    pub delete_name: Option<crate::storage::Name>,
     pub recording: bool,
     pub uptime_s: u64,
     pub fps: u32,
@@ -137,7 +141,7 @@ pub fn draw(c: &mut Canvas, st: &AppStatus) {
     match st.page {
         Page::Home => page_home_dyn(c, st, &mut d),
         Page::Audio => page_audio_dyn(c, st, &mut d),
-        Page::Storage => {}
+        Page::Storage => page_storage_dyn(c, st, &mut d),
         Page::Camera => {}
         Page::About => page_about_dyn(c, st, &mut d),
     }
@@ -152,7 +156,7 @@ pub fn draw_dynamic(c: &mut Canvas, st: &AppStatus) -> Dirty {
     match st.page {
         Page::Home => page_home_dyn(c, st, &mut d),
         Page::Audio => page_audio_dyn(c, st, &mut d),
-        Page::Storage => {}
+        Page::Storage => page_storage_dyn(c, st, &mut d),
         Page::Camera => {}
         Page::About => page_about_dyn(c, st, &mut d),
     }
@@ -411,6 +415,54 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
 
 // ---------------------------------------------------------------- AUDIO
 
+pub fn hit_media(page: Page, x: u16, y: u16, confirming: bool) -> Option<crate::media::Command> {
+    use crate::media::Command;
+    let top = if page == Page::Audio { 280 } else { 348 };
+    if (548..=779).contains(&x) {
+        if confirming && (top + 60..=top + 107).contains(&y) {
+            return Some(if x < 664 {
+                Command::ConfirmDelete
+            } else {
+                Command::CancelDelete
+            });
+        }
+        if !confirming && (top..=top + 47).contains(&y) {
+            return Some(if page == Page::Audio {
+                Command::DeleteTrack
+            } else {
+                Command::DeleteFile
+            });
+        }
+    }
+    if page == Page::Audio {
+        return hit_audio(x, y);
+    }
+    if (348..=395).contains(&y) {
+        return match x {
+            20..=183 => Some(Command::FilePrevious),
+            192..=355 => Some(Command::FileNext),
+            364..=527 => Some(Command::Refresh),
+            _ => None,
+        };
+    }
+    None
+}
+fn delete_controls(c: &mut Canvas, st: &AppStatus, y: usize, d: &mut Dirty) {
+    c.rect(548, y, 232, 108, gfx::PANEL);
+    if let Some(name) = &st.delete_name {
+        c.text(558, y + 6, "Permanently delete?", gfx::WARN, 1);
+        c.text(558, y + 28, name, gfx::TEXT, 1);
+        for (x, label) in [(548, "CONFIRM"), (664, "CANCEL")] {
+            c.rect(x, y + 60, 112, 48, gfx::PANEL_HI);
+            c.text(x + 10, y + 78, label, gfx::WARN, 1);
+        }
+    } else {
+        c.rect(548, y, 232, 48, gfx::PANEL_HI);
+        c.text(558, y + 18, "DELETE SELECTED", gfx::WARN, 1);
+        c.text(558, y + 70, "Confirmation required", gfx::MUTED, 1);
+    }
+    d.push(Rect::new(548, y, 232, 108)).ok();
+}
 pub fn hit_audio(x: u16, y: u16) -> Option<crate::media::Command> {
     use crate::media::Command;
     if (280..=327).contains(&y) {
@@ -481,7 +533,9 @@ fn page_audio_static(c: &mut Canvas, st: &AppStatus) {
         gfx::MUTED,
         1,
     );
-    let mut id:heapless::String<32>=heapless::String::new();let _=write!(id,"codec {:02X}:{:02X}",st.codec_id.0,st.codec_id.1);c.text(604,124,&id,gfx::MUTED,1);
+    let mut id: heapless::String<32> = heapless::String::new();
+    let _ = write!(id, "codec {:02X}:{:02X}", st.codec_id.0, st.codec_id.1);
+    c.text(604, 124, &id, gfx::MUTED, 1);
 }
 fn page_audio_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     let card = Card::at(8, CONTENT_Y, 784, 384);
@@ -513,6 +567,7 @@ fn page_audio_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     let _ = write!(level, "RMS {:.1}%", st.mic_level * 100.0);
     c.text(544, 222, &level, gfx::MUTED, 1);
     d.push(r).ok();
+    delete_controls(c, st, 280, d);
 }
 
 // ---------------------------------------------------------------- STORAGE
@@ -520,7 +575,14 @@ fn page_audio_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
 fn page_storage_static(c: &mut Canvas, st: &AppStatus) {
     let y = CONTENT_Y;
     let rep = st.sd.as_ref();
-    let info = Card::new(8, y, 784, 140, c, "microSD (SDMMC 4-bit @ 20 MHz, power GPIO39)");
+    let info = Card::new(
+        8,
+        y,
+        784,
+        140,
+        c,
+        "microSD (SDMMC 4-bit @ 20 MHz, power GPIO39)",
+    );
     match rep {
         None => {
             c.rect(info.x + 12, info.y + 36, 10, 10, gfx::ERR);
@@ -528,7 +590,13 @@ fn page_storage_static(c: &mut Canvas, st: &AppStatus) {
         }
         Some(r) => {
             let ok = r.card_ok;
-            c.rect(info.x + 12, info.y + 36, 10, 10, if ok { gfx::OK } else { gfx::ERR });
+            c.rect(
+                info.x + 12,
+                info.y + 36,
+                10,
+                10,
+                if ok { gfx::OK } else { gfx::ERR },
+            );
             let mut s: heapless::String<64> = heapless::String::new();
             if ok {
                 if r.capacity_mb >= 1000 {
@@ -553,68 +621,77 @@ fn page_storage_static(c: &mut Canvas, st: &AppStatus) {
             }
             c.text(info.x + 28, info.y + 34, &s, gfx::TEXT, 1);
             let mut s2: heapless::String<64> = heapless::String::new();
-            let _ = write!(s2, "{} {}  label \"{}\"", r.partition, r.fs_type, r.volume_label);
+            let _ = write!(
+                s2,
+                "{} {}  label \"{}\"",
+                r.partition, r.fs_type, r.volume_label
+            );
             c.text(info.x + 12, info.y + 58, &s2, gfx::MUTED, 1);
         }
     }
-    c.text(info.x + 12, info.y + 116, "AUDIO: play MP3/WAV and save new microphone WAV files", gfx::MUTED, 1);
+    c.text(
+        info.x + 12,
+        info.y + 116,
+        "AUDIO: play MP3/WAV and save new microphone WAV files",
+        gfx::MUTED,
+        1,
+    );
 
-    let y2 = y + 148;
-    let list = Card::new(8, y2, 380, 480 - y2 - 8, c, "Root directory (at boot)");
-    if let Some(r) = rep {
-        if r.entries.is_empty() {
-            let mut s: heapless::String<64> = heapless::String::new();
-            let _ = write!(s, "{}", r.error.unwrap_or("(empty or unsupported layout)"));
-            c.text(list.x + 12, list.y + 34, &s, gfx::MUTED, 1);
-        }
-        for (i, e) in r.entries.iter().enumerate() {
-            let ey = list.y + 34 + i * 20;
-            if ey > 460 {
-                break;
-            }
-            c.rect(list.x + 12, ey + 2, 8, 8, if e.is_dir { gfx::SKY } else { gfx::ACCENT });
-            let mut s: heapless::String<64> = heapless::String::new();
-            if e.is_dir {
-                let _ = write!(s, "{} <DIR>", e.name);
-            } else {
-                let _ = write!(s, "{} {:9} B", e.name, e.size);
-            }
-            c.text(list.x + 26, ey, &s, gfx::TEXT, 1);
-        }
+    Card::new(
+        8,
+        y + 148,
+        784,
+        480 - y - 156,
+        c,
+        "Live SD root files (8.3 aliases; up to 64)",
+    );
+    for (x, label) in [(20, "PREVIOUS"), (192, "NEXT"), (364, "RESCAN SD")] {
+        c.rect(x, 348, 164, 48, gfx::PANEL_HI);
+        c.text(x + 10, 366, label, gfx::ACCENT, 1);
     }
-
-    let txt = Card::new(396, y2, 396, 480 - y2 - 8, c, "First text file");
-    if let Some(r) = rep {
-        let lines: heapless::Vec<heapless::String<48>, 12> = {
-            let mut v = heapless::Vec::new();
-            let mut cur = heapless::String::new();
-            for ch in r.preview.chars() {
-                if ch == '\n' {
-                    if !cur.is_empty() {
-                        v.push(cur.clone()).ok();
-                        cur.clear();
-                    }
-                } else if cur.push(ch).is_err() {
-                    v.push(cur.clone()).ok();
-                    cur.clear();
-                }
-            }
-            if !cur.is_empty() {
-                v.push(cur).ok();
-            }
-            v
-        };
-        for (i, line) in lines.iter().enumerate() {
-            let ly = txt.y + 34 + i * 18;
-            if ly > 450 {
-                break;
-            }
-            c.text(txt.x + 12, ly, line, gfx::TEXT, 1);
-        }
-        if r.preview.is_empty() {
-            c.text(txt.x + 12, txt.y + 34, "(no .TXT file at root)", gfx::MUTED, 1);
-        }
-    }
+    c.text(
+        20,
+        424,
+        "Browse root files; STOP audio before deleting.",
+        gfx::MUTED,
+        1,
+    );
+    c.text(
+        20,
+        446,
+        "Folders are excluded. Deletion cannot be undone.",
+        gfx::MUTED,
+        1,
+    );
+}
+fn page_storage_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
+    c.rect(20, 264, 760, 68, gfx::PANEL);
+    c.text(
+        20,
+        264,
+        if st.sd_file_name.is_empty() {
+            "No files in SD root"
+        } else {
+            &st.sd_file_name
+        },
+        gfx::ACCENT,
+        2,
+    );
+    let mut count = heapless::String::<64>::new();
+    let _ = write!(
+        count,
+        "File {} / {}",
+        if st.sd_file_count == 0 {
+            0
+        } else {
+            st.sd_file_index + 1
+        },
+        st.sd_file_count
+    );
+    c.text(20, 292, &count, gfx::MUTED, 1);
+    c.text(20, 314, &st.media_status, gfx::TEXT, 1);
+    d.push(Rect::new(20, 264, 760, 68)).ok();
+    delete_controls(c, st, 348, d);
 }
 
 // ---------------------------------------------------------------- CAMERA

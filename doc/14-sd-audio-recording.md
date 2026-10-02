@@ -13,7 +13,9 @@ to adjust playback in 3 dB steps.
 | STOP | Stop playback, or finalize and save the recording |
 | RECORD / SAVE | Start a new recording; a second tap saves it |
 | REPLAY LAST | Play the most recent recording saved during this boot |
-| RESCAN SD | Refresh the root list while idle |
+| RESCAN SD | Refresh the root lists while idle |
+| DELETE SELECTED | Ask to permanently delete the selected file |
+| CONFIRM / CANCEL | Delete the named file, or dismiss the request |
 | SET on AUDIO | Same as RECORD / SAVE |
 | MODE | Change pages without interrupting media |
 
@@ -134,3 +136,35 @@ quiet idle, clean WAV/MP3 playback, intelligible new recordings, and one file
 selection per held PREVIOUS/NEXT touch is still pending. Existing recordings
 from the noisy configuration are preserved and may still contain static; make
 a new recording to evaluate the corrected capture path.
+
+## Confirmed audio and file deletion (2026-10-03)
+
+The user confirmed that idle is quiet, KORVOWAV.WAV and KORVOMP3.MP3 play
+cleanly, and a new microphone recording replays cleanly with firmware `fe865fc`.
+This supersedes the pending sound-quality checks above.
+
+AUDIO offers DELETE SELECTED for its current MP3/WAV selection. SD CARD has a
+live root-file browser with PREVIOUS, NEXT, RESCAN SD and DELETE SELECTED; it
+includes files of any extension. Each list shows up to 64 files independently,
+using FAT 8.3 aliases. Folders and volume labels are excluded.
+
+Deletion requires a separate CONFIRM tap beside the exact filename. CANCEL,
+selection changes, other media commands, or changing tabs dismiss the request.
+The existing release filter prevents one held touch from both requesting and
+confirming deletion. STOP playback or save a recording before deleting; a busy
+request is rejected without interrupting audio. Successful deletion refreshes
+both lists and clears REPLAY LAST if that saved recording was removed.
+
+Deletion is permanent. The local FAT patch frees file clusters, removes
+associated long-name directory slots, and updates free-space metadata. See
+[the patch notes](../vendor/embedded-sdmmc/KORVO-PATCH.md). Deletion, like recording,
+is not protected against power loss or card removal during a write.
+
+Console equivalents: `delete` (AUDIO selection), `delete-file` (SD selection),
+`confirm-delete`, `cancel-delete`, `file-next`, `file-prev`. Confirmation is
+always required; sending `confirm-delete` alone does nothing.
+
+The media host suite now has 12 passing tests, including FAT16/FAT32 deletion,
+empty/single/multiple cluster files, sector-spanning long names, open-file
+rejection, preserved neighboring files and boot sectors, and clean read-only
+filesystem checks. Physical UI confirmation is pending.

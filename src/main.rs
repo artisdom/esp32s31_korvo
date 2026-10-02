@@ -33,6 +33,7 @@ mod button_logic;
 mod buttons;
 mod camera;
 mod console;
+mod delete_request;
 mod display;
 mod es8389;
 mod fat_layout;
@@ -323,6 +324,10 @@ async fn main(_spawner: embassy_executor::Spawner) {
         media_name: heapless::String::new(),
         media_status: heapless::String::new(),
         media_count: 0,
+        sd_file_name: heapless::String::new(),
+        sd_file_count: 0,
+        sd_file_index: 0,
+        delete_name: None,
         media_seconds: 0,
         recording: false,
         uptime_s: 0,
@@ -360,6 +365,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         if let Some(btn) = buttons.poll() {
             match btn {
                 Button::Mode => {
+                    media.delete_request.cancel();
                     st.page = st.page.next();
                 }
                 Button::Set => {
@@ -401,9 +407,12 @@ async fn main(_spawner: embassy_executor::Spawner) {
             }
             if let Some((x, y)) = touch_action.update(st.touch_point, start.elapsed().as_millis()) {
                 if let Some(page) = ui::hit_tabs(x, y) {
+                    media.delete_request.cancel();
                     st.page = page;
-                } else if st.page == Page::Audio {
-                    if let Some(cmd) = ui::hit_audio(x, y) {
+                } else if matches!(st.page, Page::Audio | Page::Storage) {
+                    if let Some(cmd) =
+                        ui::hit_media(st.page, x, y, media.delete_request.name().is_some())
+                    {
                         media.command(cmd, &mut audio);
                     }
                 }
@@ -426,6 +435,14 @@ async fn main(_spawner: embassy_executor::Spawner) {
         let _ = st.media_name.push_str(media.selected_name());
         st.media_status = media.status.clone();
         st.media_count = media.tracks.len();
+        st.sd_file_name = media
+            .files
+            .get(media.file_selected)
+            .cloned()
+            .unwrap_or_default();
+        st.sd_file_count = media.files.len();
+        st.sd_file_index = media.file_selected;
+        st.delete_name = media.delete_request.name().cloned();
         st.media_seconds = media.seconds;
         st.recording = media.recording();
         st.mic_level = audio.mic_level;

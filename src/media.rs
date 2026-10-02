@@ -21,11 +21,20 @@ pub enum Command {
     Demo,
     Tone,
     Mic,
+    FileNext,
+    FilePrevious,
+    DeleteTrack,
+    DeleteFile,
+    ConfirmDelete,
+    CancelDelete,
 }
 pub struct Media {
     storage: Option<Storage>,
     pub tracks: heapless::Vec<Name, 64>,
     pub selected: usize,
+    pub files: heapless::Vec<Name, 64>,
+    pub file_selected: usize,
+    pub delete_request: crate::delete_request::DeleteRequest<Name>,
     pub status: heapless::String<64>,
     pub last_recording: Option<Name>,
     player: Option<Player>,
@@ -62,6 +71,9 @@ impl Media {
             storage,
             tracks: heapless::Vec::new(),
             selected: 0,
+            files: heapless::Vec::new(),
+            file_selected: 0,
+            delete_request: crate::delete_request::DeleteRequest::new(),
             status: heapless::String::new(),
             last_recording: None,
             player: None,
@@ -93,9 +105,17 @@ impl Media {
         self.recorder.is_some()
     }
     fn refresh(&mut self) {
-        match self.storage.as_ref().map(|s| s.tracks()) {
-            Some(Ok(tracks)) => {
-                self.tracks = tracks;
+        match self.storage.as_ref().map(|s| s.files()) {
+            Some(Ok(files)) => {
+                match self.storage.as_ref().unwrap().tracks() {
+                    Ok(tracks) => self.tracks = tracks,
+                    Err(e) => {
+                        self.message(e);
+                        return;
+                    }
+                }
+                self.files = files;
+                self.file_selected = self.file_selected.min(self.files.len().saturating_sub(1));
                 self.selected = self.selected.min(self.tracks.len().saturating_sub(1));
                 self.message("Ready (SD root, MP3 / PCM WAV)");
             }
@@ -104,7 +124,68 @@ impl Media {
         }
     }
     pub fn command(&mut self, cmd: Command, audio: &mut Audio) {
+        if !matches!(cmd, Command::ConfirmDelete | Command::CancelDelete) {
+            self.delete_request.cancel();
+        }
         match cmd {
+            Command::DeleteTrack | Command::DeleteFile => {
+                let busy = self.player.is_some()
+                    || self.recorder.is_some()
+                    || audio.source() != Source::Silence;
+                if busy {
+                    self.message("STOP playback / recording before deleting");
+                    return;
+                }
+                let name = if matches!(cmd, Command::DeleteTrack) {
+                    self.tracks.get(self.selected)
+                } else {
+                    self.files.get(self.file_selected)
+                }
+                .cloned();
+                if let Some(name) = name {
+                    esp_println::println!("delete confirmation: {}", name);
+                    self.delete_request.arm(name, false);
+                } else {
+                    self.message("No file selected");
+                }
+            }
+            Command::ConfirmDelete => {
+                let busy = self.player.is_some()
+                    || self.recorder.is_some()
+                    || audio.source() != Source::Silence;
+                if let Some(name) = self.delete_request.confirm(busy) {
+                    let result = self
+                        .storage
+                        .as_ref()
+                        .ok_or("No SD")
+                        .and_then(|s| s.delete(name.as_str()));
+                    match result {
+                        Ok(()) => {
+                            if self.last_recording.as_ref() == Some(&name) {
+                                self.last_recording = None;
+                            }
+                            self.refresh();
+                            let mut msg = heapless::String::<64>::new();
+                            let _ = write!(msg, "Deleted {}", name);
+                            self.message(&msg);
+                        }
+                        Err(e) => self.message(e),
+                    }
+                }
+            }
+            Command::CancelDelete => {
+                self.delete_request.cancel();
+            }
+            Command::FileNext | Command::FilePrevious => {
+                if !self.files.is_empty() {
+                    self.file_selected = if matches!(cmd, Command::FileNext) {
+                        (self.file_selected + 1) % self.files.len()
+                    } else {
+                        (self.file_selected + self.files.len() - 1) % self.files.len()
+                    };
+                    esp_println::println!("SD selected: {}", self.files[self.file_selected]);
+                }
+            }
             Command::Mic => audio.debug_samples(),
             Command::Tone => {
                 self.stop(audio);
@@ -118,6 +199,7 @@ impl Media {
                     } else {
                         (self.selected + self.tracks.len() - 1) % self.tracks.len()
                     };
+                    esp_println::println!("Audio selected: {}", self.selected_name());
                 }
             }
             Command::Stop => self.stop(audio),

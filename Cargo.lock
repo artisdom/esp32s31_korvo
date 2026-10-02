@@ -648,8 +648,6 @@ dependencies = [
 [[package]]
 name = "embedded-sdmmc"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fc3ac32bcb461732f1cbc1f199ae3c09f150b18ac6f48a560bef91e0d73ca30"
 dependencies = [
  "arbitrary-int",
  "bitbybit",

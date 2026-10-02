@@ -1,4 +1,4 @@
-//! FAT adapter for the async native SDMMC card. Only new files are created.
+//! FAT adapter for the async native SDMMC card. Creates recordings and deletes explicitly confirmed root files.
 use crate::{fat_layout::Layout, sdcard::CardDevice};
 use aligned::{A4, Aligned};
 use core::{cell::RefCell, fmt, fmt::Write};
@@ -109,13 +109,19 @@ impl Storage {
         Ok(Self { fs, root })
     }
     pub fn tracks(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
+        self.list_files(true)
+    }
+    pub fn files(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
+        self.list_files(false)
+    }
+    fn list_files(&self, audio_only: bool) -> Result<heapless::Vec<Name, 64>, &'static str> {
         let mut out = heapless::Vec::new();
         self.fs
             .iterate_dir(self.root, |entry| {
                 if !entry.attributes.is_directory() && !entry.attributes.is_volume() {
                     let mut name = Name::new();
                     let _ = write!(name, "{}", entry.name);
-                    if name.ends_with(".WAV") || name.ends_with(".MP3") {
+                    if !audio_only || name.ends_with(".WAV") || name.ends_with(".MP3") {
                         let _ = out.push(name);
                     }
                 }
@@ -123,6 +129,19 @@ impl Storage {
             })
             .map_err(|_| "directory read")?;
         Ok(out)
+    }
+    pub fn delete(&self, name: &str) -> Result<(), &'static str> {
+        let entry = self
+            .fs
+            .find_directory_entry(self.root, name)
+            .map_err(|_| "File no longer available")?;
+        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+            return Err("Only root files can be deleted");
+        }
+        self.fs.delete_entry_in_dir(self.root, name).map_err(|e| {
+            esp_println::println!("FAT delete {}: {:?}", name, e);
+            "Delete failed - RESCAN SD"
+        })
     }
     pub fn create_recording(&self) -> Result<(RawFile, Name), &'static str> {
         let mut next = 1u32;

@@ -30,6 +30,11 @@ impl Console {
                     "demo" => Some(Command::Demo),
                     "tone" => Some(Command::Tone),
                     "mic" => Some(Command::Mic),
+                    "video-play" => Some(Command::VideoPlay),
+                    "video-replay" => Some(Command::VideoReplay),
+                    "video-next" => Some(Command::VideoNext),
+                    "video-prev" => Some(Command::VideoPrevious),
+                    "file-play" => Some(Command::PlayFile),
                     "video" => Some(Command::VideoRecord),
                     "delete" => Some(Command::DeleteTrack),
                     "delete-file" => Some(Command::DeleteFile),
@@ -42,7 +47,7 @@ impl Console {
                 esp_println::println!("console: {}", self.line);
                 if cmd.is_none() {
                     esp_println::println!(
-                        "commands: play stop next prev record replay video rescan demo tone mic
+                        "commands: play stop next prev record replay video video-play video-replay video-next video-prev file-play rescan demo tone mic
                          delete delete-file confirm-delete cancel-delete file-next file-prev"
                     );
                 }

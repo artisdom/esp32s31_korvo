@@ -64,6 +64,10 @@ pub struct AppStatus {
     pub delete_name: Option<crate::storage::Name>,
     pub recording: bool,
     pub video_recording: bool,
+    pub video_playing: bool,
+    pub video_selected: heapless::String<32>,
+    pub video_count: usize,
+    pub video_index: usize,
     pub video_name: crate::storage::Name,
     pub video_frames: u32,
     pub camera_frames: u32,
@@ -291,13 +295,6 @@ fn page_home_static(c: &mut Canvas, st: &AppStatus) {
         gfx::MUTED,
         1,
     );
-    c.text(
-        soc.x + 12,
-        soc.y + 120,
-        "(radio: upstream esp-radio)",
-        gfx::MUTED,
-        1,
-    );
 
     let mem = Card::new(8 + CW + GAP, CONTENT_Y, CW, CH1, c, "Memory");
     c.text(mem.x + 12, mem.y + 74, "16 MB flash (QIO)", gfx::MUTED, 1);
@@ -397,6 +394,74 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         let mut s: heapless::String<40> = heapless::String::new();
         let _ = write!(s, "up {}s   loop {} fps", st.uptime_s, st.fps);
         c.text(card.x + 12, card.y + 66, &s, gfx::MUTED, 1);
+        d.push(r).ok();
+    }
+    {
+        let card = Card::at(8, CONTENT_Y, CW, CH1);
+        let r = card.begin_dyn(c, 6, 118, 246, 58);
+        #[cfg(feature = "radio-wifi-ble")]
+        {
+            use crate::radio::status;
+            use core::sync::atomic::Ordering;
+            let wifi = match status::WIFI.load(Ordering::Relaxed) {
+                1 => "Wi-Fi scanning",
+                2 => "Wi-Fi scan ready",
+                3 => "Wi-Fi connecting",
+                4 => "Wi-Fi associated",
+                5 => "Wi-Fi connected / IP ready",
+                6 => "Wi-Fi error / retry",
+                _ => "Wi-Fi starting",
+            };
+            c.text(card.x + 12, card.y + 120, wifi, gfx::SKY, 1);
+            let ble = match status::BLE.load(Ordering::Relaxed) {
+                1 => "BLE advertising: Korvo-S31",
+                2 => "BLE connected / GATT",
+                _ => "BLE starting",
+            };
+            c.text(card.x + 12, card.y + 138, ble, gfx::TEXT, 1);
+            let mut counts = heapless::String::<40>::new();
+            let _ = write!(
+                counts,
+                "{} APs / TCP echo :2323",
+                status::APS.load(Ordering::Relaxed)
+            );
+            c.text(card.x + 12, card.y + 156, &counts, gfx::MUTED, 1);
+        }
+        #[cfg(feature = "radio-802154")]
+        {
+            use crate::radio::status;
+            use core::sync::atomic::Ordering;
+            let mut counts = heapless::String::<40>::new();
+            let _ = write!(
+                counts,
+                "802.15.4 scanning ch {}",
+                status::CHANNEL.load(Ordering::Relaxed)
+            );
+            c.text(card.x + 12, card.y + 120, &counts, gfx::SKY, 1);
+            counts.clear();
+            let _ = write!(
+                counts,
+                "RX {} / Zigbee beacons {}",
+                status::RECEIVED.load(Ordering::Relaxed),
+                status::ZIGBEE_BEACONS.load(Ordering::Relaxed)
+            );
+            c.text(card.x + 12, card.y + 138, &counts, gfx::TEXT, 1);
+            c.text(
+                card.x + 12,
+                card.y + 156,
+                "Discovery / no network joined",
+                gfx::MUTED,
+                1,
+            );
+        }
+        #[cfg(not(any(feature = "radio-wifi-ble", feature = "radio-802154")))]
+        c.text(
+            card.x + 12,
+            card.y + 120,
+            "Radios disabled in this build",
+            gfx::MUTED,
+            1,
+        );
         d.push(r).ok();
     }
     // Memory: free numbers
@@ -513,8 +578,12 @@ pub fn hit_media(page: Page, x: u16, y: u16, confirming: bool) -> Option<crate::
     if page == Page::Camera {
         if (400..=447).contains(&y) {
             return match x {
-                20..=183 => Some(Command::VideoRecord),
-                192..=355 => Some(Command::Stop),
+                20..=139 => Some(Command::VideoPrevious),
+                148..=267 => Some(Command::VideoNext),
+                276..=395 => Some(Command::VideoPlay),
+                404..=523 => Some(Command::Stop),
+                532..=651 => Some(Command::VideoRecord),
+                660..=779 => Some(Command::VideoReplay),
                 _ => None,
             };
         }
@@ -539,6 +608,9 @@ pub fn hit_media(page: Page, x: u16, y: u16, confirming: bool) -> Option<crate::
     }
     if page == Page::Audio {
         return hit_audio(x, y);
+    }
+    if (408..=455).contains(&y) && (364..=527).contains(&x) {
+        return Some(Command::PlayFile);
     }
     if (348..=395).contains(&y) {
         return match x {
@@ -752,20 +824,10 @@ fn page_storage_static(c: &mut Canvas, st: &AppStatus) {
         c.rect(x, 348, 164, 48, gfx::PANEL_HI);
         c.text(x + 10, 366, label, gfx::ACCENT, 1);
     }
-    c.text(
-        20,
-        424,
-        "Browse root files; STOP audio before deleting.",
-        gfx::MUTED,
-        1,
-    );
-    c.text(
-        20,
-        446,
-        "Folders are excluded. Deletion cannot be undone.",
-        gfx::MUTED,
-        1,
-    );
+    c.rect(364, 408, 164, 48, gfx::PANEL_HI);
+    c.text(374, 426, "PLAY FILE", gfx::ACCENT, 1);
+    c.text(20, 424, "STOP before deleting.", gfx::MUTED, 1);
+    c.text(20, 446, "Delete cannot be undone.", gfx::MUTED, 1);
 }
 fn page_storage_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     c.rect(20, 264, 760, 68, gfx::PANEL);
@@ -826,16 +888,21 @@ fn page_camera_static(c: &mut Canvas, st: &AppStatus) {
         gfx::MUTED,
         1,
     );
-    for (x, label) in [(20, "RECORD / SAVE"), (192, "STOP / SAVE")] {
-        c.rect(x, 400, 164, 48, gfx::PANEL_HI);
-        c.text(x + 10, 418, label, gfx::ACCENT, 1);
+    for (x, label) in [
+        (20, "PREVIOUS"),
+        (148, "NEXT"),
+        (276, "PLAY"),
+        (404, "STOP / SAVE"),
+        (532, "REC / SAVE"),
+        (660, "REPLAY LAST"),
+    ] {
+        c.rect(x, 400, 120, 48, gfx::PANEL_HI);
+        c.text(x + 8, 418, label, gfx::ACCENT, 1);
     }
-    c.text(364, 406, "AVI files appear in SD CARD.", gfx::MUTED, 1);
-    c.text(364, 428, "Stop before removing SD / power.", gfx::MUTED, 1);
     c.text(
         20,
         460,
-        "Open preview before recording; JPEG video + microphone are saved together.",
+        "Select an AVI to watch; REC / SAVE records camera + microphone. Stop before power off.",
         gfx::MUTED,
         1,
     );
@@ -845,7 +912,9 @@ fn page_camera_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     c.text(
         364,
         242,
-        if st.camera_frames == 0 {
+        if st.video_playing {
+            "PLAYING VIDEO + MICROPHONE AUDIO"
+        } else if st.camera_frames == 0 {
             "Waiting for camera frames..."
         } else if st.video_recording {
             "RECORDING VIDEO + MICROPHONE"
@@ -859,12 +928,29 @@ fn page_camera_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         },
         1,
     );
-    c.text(364, 264, &st.video_name, gfx::ACCENT, 2);
+    c.text(
+        364,
+        264,
+        if st.video_playing || st.video_recording {
+            &st.video_name
+        } else {
+            &st.video_selected
+        },
+        gfx::ACCENT,
+        2,
+    );
     let mut counts = heapless::String::<96>::new();
     let _ = write!(
         counts,
-        "Preview {}  retries {}  saved frames {}",
-        st.camera_frames, st.camera_errors, st.video_frames
+        "AVI {}/{}  frame {}  {}s",
+        if st.video_count == 0 {
+            0
+        } else {
+            st.video_index + 1
+        },
+        st.video_count,
+        st.video_frames,
+        st.media_seconds
     );
     c.text(364, 294, &counts, gfx::TEXT, 1);
     c.text(364, 316, &st.media_status, gfx::TEXT, 1);
@@ -876,6 +962,16 @@ pub fn draw_camera_frame(c: &mut Canvas, frame: &[u8]) {
         for x in 0..crate::avi::WIDTH {
             c.set(20 + x, 120 + y, crate::avi::rgb565(frame, x, y));
         }
+    }
+}
+
+pub fn draw_playback_frame(c: &mut Canvas, frame: &[u8]) {
+    for (index, pixel) in frame.chunks_exact(2).enumerate() {
+        c.set(
+            20 + index % crate::avi::WIDTH,
+            120 + index / crate::avi::WIDTH,
+            u16::from_le_bytes([pixel[0], pixel[1]]),
+        );
     }
 }
 
@@ -950,10 +1046,10 @@ fn page_about_static(c: &mut Canvas, st: &AppStatus) {
                 "no card"
             },
         ),
-        ("WS2812 LED (RMT)", "works"),
+        ("WS2812 LED (RMT)", "disabled at user request"),
         ("ADC button ladder", "debounced; 0 raw = idle"),
         ("USB HS CDC (Type-A)", "works"),
-        ("Wi-Fi/BLE/Thread", "upstream (esp-radio) - not yet"),
+        ("Radios", "optional Wi-Fi/BLE or 802.15.4"),
     ];
     for (i, (k, v)) in rows.iter().enumerate() {
         let ry = a.y + 172 + i * 18;

@@ -5,6 +5,9 @@
 //! directions. The TX unit generates those clocks; the RX unit runs as
 //! slave from the TX clock signals through the hardware clock loopback.
 
+extern crate alloc;
+use alloc::boxed::Box;
+
 use esp_hal::{
     gpio::InputSignal,
     i2s::master::{Channels, DataFormat, I2s, TdmConfig},
@@ -61,7 +64,9 @@ pub fn build_i2s(
 
 const TX_CHUNK: usize = 8192;
 
-const RX_CHUNK: usize = 8192;
+// Drain up to half the ring each pass so SD/radio load cannot limit capture
+// throughput to 8192 bytes times the UI loop frequency.
+const RX_CHUNK: usize = 32768;
 
 /// 256-entry sine table (Bhaskara approximation, ~1.6% max error — fine
 /// for a demonstration tone).
@@ -108,7 +113,7 @@ pub struct Audio {
     /// Extremes of the last mic block (diagnostics).
     pub mic_min: i16,
     pub mic_max: i16,
-    mic_scratch: [u8; RX_CHUNK],
+    mic_scratch: Box<[u8]>,
 }
 
 type TxTransfer = esp_hal::i2s::master::I2sTxDmaTransfer<
@@ -181,7 +186,7 @@ impl Audio {
             mic_level: 0.0,
             mic_min: 0,
             mic_max: 0,
-            mic_scratch: [0; RX_CHUNK],
+            mic_scratch: crate::psram_buffer::zeroed(RX_CHUNK),
         })
     }
 
@@ -272,7 +277,11 @@ impl Audio {
         }
 
         let free = self.tx_transfer.available();
-        if self.source != Source::File && free >= TX_CHUNK {
+        for _ in 0..if self.source != Source::File {
+            free / TX_CHUNK
+        } else {
+            0
+        } {
             let mut sample_gen = SampleGen {
                 phase: self.phase,
                 phase_inc: self.phase_inc,

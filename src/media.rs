@@ -28,6 +28,11 @@ pub enum Command {
     ConfirmDelete,
     CancelDelete,
     VideoRecord,
+    VideoPlay,
+    VideoReplay,
+    VideoNext,
+    VideoPrevious,
+    PlayFile,
 }
 pub struct Media {
     storage: Option<Storage>,
@@ -39,6 +44,11 @@ pub struct Media {
     pub status: heapless::String<64>,
     pub last_recording: Option<Name>,
     player: Option<Player>,
+    video_player: Option<crate::video_player::Player>,
+    video_decoder: &'static crate::jpeg_decoder::Worker,
+    pub videos: heapless::Vec<Name, 64>,
+    pub video_selected: usize,
+    pub last_video: Option<Name>,
     recorder: Option<Recorder>,
     buffer: Box<[u8]>,
     output: Box<[u8]>,
@@ -86,7 +96,11 @@ struct Recorder {
     buffer: Box<[u8]>,
 }
 impl Media {
-    pub fn new(storage: Option<Storage>, encoder: &'static crate::jpeg_worker::Worker) -> Self {
+    pub fn new(
+        storage: Option<Storage>,
+        encoder: &'static crate::jpeg_worker::Worker,
+        video_decoder: &'static crate::jpeg_decoder::Worker,
+    ) -> Self {
         let mut m = Self {
             storage,
             tracks: heapless::Vec::new(),
@@ -97,6 +111,11 @@ impl Media {
             status: heapless::String::new(),
             last_recording: None,
             player: None,
+            video_player: None,
+            video_decoder,
+            videos: heapless::Vec::new(),
+            video_selected: 0,
+            last_video: None,
             recorder: None,
             buffer: vec![0; 16384].into_boxed_slice(),
             output: vec![0; 32768].into_boxed_slice(),
@@ -133,7 +152,36 @@ impl Media {
     pub fn video_recording(&self) -> bool {
         self.video.is_some()
     }
+    pub fn playing(&self) -> bool {
+        self.player.is_some() || self.video_playing()
+    }
+    pub fn video_playing(&self) -> bool {
+        self.video_player.is_some()
+    }
+    pub fn playback_frame(&self) -> Option<&[u8]> {
+        self.video_player.as_ref()?.image.as_deref()
+    }
+    pub fn frame_presented(&mut self) {
+        if let Some(p) = self.video_player.as_mut() {
+            p.changed = false;
+        }
+    }
+    pub fn playback_changed(&self) -> bool {
+        self.video_player.as_ref().is_some_and(|p| p.changed)
+    }
+    pub fn selected_video(&self) -> &str {
+        self.videos
+            .get(self.video_selected)
+            .map(|n| n.as_str())
+            .unwrap_or("No AVI recordings")
+    }
+    pub fn selected_file_video(&self) -> bool {
+        self.files
+            .get(self.file_selected)
+            .is_some_and(|n| n.ends_with(".AVI"))
+    }
     fn refresh(&mut self) {
+        let selected_video = self.videos.get(self.video_selected).cloned();
         match self.storage.as_ref().map(|s| s.files()) {
             Some(Ok(files)) => {
                 match self.storage.as_ref().unwrap().tracks() {
@@ -143,6 +191,16 @@ impl Media {
                         return;
                     }
                 }
+                match self.storage.as_ref().unwrap().videos() {
+                    Ok(videos) => self.videos = videos,
+                    Err(e) => {
+                        self.message(e);
+                        return;
+                    }
+                }
+                self.video_selected = selected_video
+                    .and_then(|name| self.videos.iter().position(|n| *n == name))
+                    .unwrap_or_else(|| self.videos.len().saturating_sub(1));
                 self.files = files;
                 self.file_selected = self.file_selected.min(self.files.len().saturating_sub(1));
                 self.selected = self.selected.min(self.tracks.len().saturating_sub(1));
@@ -157,6 +215,38 @@ impl Media {
             self.delete_request.cancel();
         }
         match cmd {
+            Command::VideoNext | Command::VideoPrevious => {
+                if !self.videos.is_empty() {
+                    self.video_selected = if matches!(cmd, Command::VideoNext) {
+                        (self.video_selected + 1) % self.videos.len()
+                    } else {
+                        (self.video_selected + self.videos.len() - 1) % self.videos.len()
+                    };
+                    esp_println::println!("Video selected: {}", self.selected_video());
+                }
+            }
+            Command::VideoPlay | Command::VideoReplay | Command::PlayFile => {
+                self.stop(audio);
+                let name = match cmd {
+                    Command::VideoReplay => self
+                        .last_video
+                        .clone()
+                        .or_else(|| self.videos.last().cloned()),
+                    Command::PlayFile => self.files.get(self.file_selected).cloned(),
+                    _ => self.videos.get(self.video_selected).cloned(),
+                };
+                let result = match name {
+                    Some(name) if name.ends_with(".AVI") => self.start_video_playback(name, audio),
+                    Some(name) if name.ends_with(".WAV") || name.ends_with(".MP3") => {
+                        self.start_playback(&name, audio)
+                    }
+                    Some(_) => Err("Select an AVI / WAV / MP3 file"),
+                    None => Err("No video recording selected"),
+                };
+                if let Err(e) = result {
+                    self.message(e);
+                }
+            }
             Command::VideoRecord => {
                 if self.video.is_some() {
                     self.stop(audio);
@@ -170,8 +260,7 @@ impl Media {
                 }
             }
             Command::DeleteTrack | Command::DeleteFile => {
-                let busy =
-                    self.player.is_some() || self.recording() || audio.source() != Source::Silence;
+                let busy = self.playing() || self.recording() || audio.source() != Source::Silence;
                 if busy {
                     self.message("STOP playback / recording before deleting");
                     return;
@@ -190,8 +279,7 @@ impl Media {
                 }
             }
             Command::ConfirmDelete => {
-                let busy =
-                    self.player.is_some() || self.recording() || audio.source() != Source::Silence;
+                let busy = self.playing() || self.recording() || audio.source() != Source::Silence;
                 if let Some(name) = self.delete_request.confirm(busy) {
                     let result = self
                         .storage
@@ -202,6 +290,9 @@ impl Media {
                         Ok(()) => {
                             if self.last_recording.as_ref() == Some(&name) {
                                 self.last_recording = None;
+                            }
+                            if self.last_video.as_ref() == Some(&name) {
+                                self.last_video = None;
                             }
                             self.refresh();
                             let mut msg = heapless::String::<64>::new();
@@ -278,11 +369,27 @@ impl Media {
                 }
             }
             Command::Refresh => {
-                if self.player.is_none() && !self.recording() {
+                if !self.playing() && !self.recording() {
                     self.refresh();
                 }
             }
         }
+    }
+    fn start_video_playback(&mut self, name: Name, audio: &mut Audio) -> Result<(), &'static str> {
+        self.generation = self.generation.wrapping_add(1);
+        let player = crate::video_player::Player::new(
+            self.storage.as_ref().ok_or("No SD")?,
+            name.clone(),
+            self.video_decoder,
+            self.generation,
+        )?;
+        self.video_name = name;
+        self.video_frames = 0;
+        self.seconds = 0;
+        self.video_player = Some(player);
+        audio.set_source(Source::File);
+        self.message("Playing AVI video + microphone audio");
+        Ok(())
     }
     fn start_video(&mut self) -> Result<(), &'static str> {
         let s = self.storage.as_ref().ok_or("No writable SD")?;
@@ -464,7 +571,11 @@ impl Media {
         if result.is_err() || !closed || v.failed {
             self.message("AVI save incomplete - check SD");
         } else {
-            self.message("Video + microphone saved (AVI in SD root)");
+            self.last_video = Some(v.name.clone());
+            if let Some(index) = self.videos.iter().position(|n| *n == v.name) {
+                self.video_selected = index;
+            }
+            self.message("Video saved - REPLAY LAST to watch");
             esp_println::println!(
                 "video saved: {} frames={} audio={} bytes={}",
                 v.name,
@@ -637,6 +748,17 @@ impl Media {
         Err("WAV has no data chunk")
     }
     pub fn stop(&mut self, audio: &mut Audio) {
+        if let Some(p) = self.video_player.take() {
+            esp_println::println!(
+                "video playback stopped: {} displayed={} elapsed={}s",
+                p.name,
+                p.displayed,
+                p.seconds
+            );
+            if let Some(s) = &self.storage {
+                let _ = s.fs.close_file(p.file);
+            }
+        }
         let had_video = self.video.is_some();
         if had_video {
             self.finish_video();
@@ -735,6 +857,25 @@ impl Media {
         }
     }
     pub fn poll(&mut self, audio: &mut Audio) {
+        if let Some(player) = self.video_player.as_mut() {
+            let result = player.poll(self.storage.as_ref().unwrap(), audio);
+            self.seconds = player.seconds;
+            self.video_frames = player.displayed;
+            match result {
+                Ok(true) => {
+                    self.stop(audio);
+                    self.message("Video playback complete");
+                }
+                Err(e) => {
+                    self.stop(audio);
+                    self.message(e);
+                }
+                Ok(false) => {}
+            }
+            return;
+        }
+        // Consume an abandoned decode after STOP so the mailbox can serve a new file.
+        let _ = self.video_decoder.take();
         if self.player.is_none() {
             return;
         }

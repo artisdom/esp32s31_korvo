@@ -3,16 +3,17 @@
 The S31 silicon supports 2.4 GHz Wi-Fi 6, Bluetooth 5.4 LE, Bluetooth Classic,
 Zigbee 3.0 and Thread 1.4. The Rust application now has optional Wi-Fi/BLE and
 802.15.4 discovery builds. These are separate from the default media build.
-They are **build-tested, not yet validated on this board**. No wireless protocol
-is described here as working on hardware until a flash and an over-the-air
-check have succeeded.
+Wi-Fi scan/association/DHCP/TCP echo and BLE GATT have now passed hardware
+checks on this board. DHCP is intermittent across resets and remains under
+investigation; Wi-Fi 6 negotiation has not been verified with an AX access point.
+802.15.4 discovery is currently build-tested only.
 
 ## What is implemented
 
 | Protocol | Application in this checkout | Remaining validation or implementation |
 | --- | --- | --- |
-| Wi-Fi | 2.4 GHz B/G/N/**AX explicitly enabled**, scan with channel/RSSI; optional station connection, DHCP and TCP echo on port 2323 | Board scan, association, DHCP and echo test; Wi-Fi 6 negotiation requires a compatible access point |
-| Bluetooth LE | Connectable `Korvo-S31` advertising, custom GATT service with readable/notifiable uptime in seconds | Discover and connect with a phone; read and subscribe |
+| Wi-Fi | 2.4 GHz B/G/N/**AX explicitly enabled**, scan with channel/RSSI; optional station connection, DHCP and TCP echo on port 2323 | Hardware scan/association/DHCP/echo passed; intermittent DHCP across resets; AX negotiation needs a compatible access point |
+| Bluetooth LE | Connectable `Korvo-S31` advertising, custom GATT service with readable/notifiable uptime in seconds | Host adapter discovered and connected, read uptime and received five notifications; phone testing remains |
 | IEEE 802.15.4 | Channel 11–26 active discovery, MAC beacon requests, received frame channel/RSSI/LQI; identifies Zigbee PRO beacon extended PAN and capacity | Receive beacons from a nearby coordinator; test TX/RX with a second radio |
 | Zigbee | Zigbee beacon discovery | Full commissioning, security, joining and application clusters are not implemented |
 | Thread | Available 802.15.4 PHY/MAC; no Thread host stack | MLE, 6LoWPAN, IPv6 routing, commissioning and network dataset support are not implemented |
@@ -111,6 +112,22 @@ introduce ESP-IDF, C application code, Bluedroid or C++ OpenThread.
 - [OpenThread](https://github.com/openthread/openthread): a full Thread implementation in C/C++. Wrapping it in Rust would not meet a strict Rust host-stack requirement.
 - [Remade-With-Rust rusty_esp_signal](https://github.com/Remade-With-Rust/rusty_esp_signal): Rust radio application framing/telemetry on existing driver stacks; it does not provide missing Classic or Thread host stacks.
 
-Keep the working default media firmware installed until the optional radio
-build has a coordinated hardware test window. Then validate Wi-Fi/BLE first,
-restore or reflash the desired build, and test 802.15.4 with a coordinator/peer.
+## Hardware checks, 2026-10-03
+
+The Wi-Fi/BLE firmware scanned 9–15 access points, associated with the user's
+WPA2 network, obtained a DHCP lease and echoed ten TCP payloads on port 2323.
+Some subsequent boots associated but failed to obtain a lease within 80 seconds;
+that reliability issue is unresolved. A host BlueZ/Bleak client discovered
+`Korvo-S31`, connected, read the uptime characteristic and received five
+notifications at one-second intervals. Credentials remain in an ignored local
+build file and are not committed or logged.
+
+Two 33-second camera + microphone recordings completed with radios running;
+LCD underruns stayed zero and no new RX overruns accumulated while recording.
+The build's one RX overrun was already present before recording. These tests
+required increasing the microphone drain to 32 KiB per UI loop. Home now shows
+radio task snapshots (Wi-Fi phase/AP count/BLE connection or discovery channel
+and RX/beacon count) instead of a static radio claim.
+
+No Zigbee coordinator or Thread border router is available, so commissioning
+and real mesh interoperability require a later peer-based hardware check.

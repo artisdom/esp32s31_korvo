@@ -8,7 +8,7 @@ is linked into the application.
 
 ## Controls and formats
 
-Open CAMERA and wait for the preview and “Camera ready”. Tap RECORD / SAVE,
+Open CAMERA and wait for the preview and “Camera ready”. Tap REC / SAVE,
 or press SET on CAMERA, to start. Tap it again or STOP / SAVE to finalize the
 AVI header and close the file. Recording continues when changing tabs. STOP
 on AUDIO also saves an active video recording. The speaker amplifier stays
@@ -21,15 +21,25 @@ aligned with the audio sample timeline. Video duration rounds up to the next
 200 ms interval. The audio stream retains its actual sample count.
 
 Files appear in SD CARD and can be removed through its existing filename
-confirmation flow after recording stops. AVI playback is on a computer, such
-as VLC or ffplay; the on-board AUDIO browser still plays MP3 and PCM WAV.
+confirmation flow after recording or playback stops. CAMERA has PREVIOUS/NEXT
+for its independent AVI list, PLAY for the selected recording and REPLAY LAST
+for the recording saved this session (or the last AVI in the directory after
+boot). STOP ends playback. SD CARD's PLAY FILE opens CAMERA for AVI or AUDIO
+for WAV/MP3. The AUDIO browser continues to list MP3 and PCM WAV.
+
+On-board playback supports **this application's finalized 320x240/5 fps
+MJPEG + PCM16 stereo/48 kHz AVI format**. External AVI layouts, other video
+codecs/resolutions, MP4 and unfinished recordings are rejected. Recordings can
+also be played on a computer with VLC or ffplay.
 Recordings automatically save at a 1 GiB media-data limit. Stop and wait for
-“Video + microphone saved” before disconnecting power or removing the card;
+“Video saved - REPLAY LAST to watch” before disconnecting power or removing the card;
 unfinished files are not recovered automatically after interruption.
 
 UART0 command `video` toggles video recording and opens CAMERA. At boot, send
 it once to open the preview, wait for frames, then send it again to record.
-`stop` saves. A missing card, unsupported sensor, failed encoder or SD write
+`stop` saves. `video-play` plays the selected AVI, `video-replay` replays the
+last recording, `video-next` / `video-prev` select files, and `file-play` opens
+the selected SD CARD file. A missing card, unsupported sensor, failed encoder or SD write
 is reported rather than treated as a successful save.
 
 ## Sensor and DMA implementation
@@ -53,8 +63,8 @@ full LCD page repaint and resumed afterward. The camera STOP_EN setting
 follows the vendor's continuous-capture policy, rather than aborting whenever
 the RX FIFO briefly fills.
 
-Core 0 services I2S, SD, inputs and LCD. Core 1 compresses JPEG through a bounded
-atomic mailbox and also services USB CDC. Record generations prevent a JPEG
+Core 0 services I2S, SD, inputs and LCD. Core 1 compresses and decodes JPEG through separate bounded
+atomic mailboxes and also services USB CDC. Record generations prevent a JPEG
 from a stopped session being used in a later recording. Core 1 requires a
 64 KiB stack; the original 8 KiB USB-only stack was insufficient. Its ROM PMA
 layout allowed PSRAM reads but rejected writes, so the bootloader's working
@@ -63,7 +73,7 @@ and JPEG buffers explicitly use the PSRAM heap. JPEG quality is 45.
 
 ## Validation, 2026-10-03
 
-The host media suite has 14 passing tests, including an AVI decoded by
+The host media suite has 17 passing tests, including an AVI decoded by
 FFmpeg/ffprobe, odd-length JPEG chunk padding, matching one-second audio/video
 streams, and cross-thread JPEG mailbox ownership and generation checks.
 
@@ -86,5 +96,37 @@ Physical verification of preview appearance, motion, intelligible speech
 and touch/button controls remains pending. Prototype recordings already on
 the SD card may be partial or faulty; use a new recording to evaluate this
 implementation. Higher resolutions, full-field scaling, hardware JPEG,
-video playback on the LCD, AVI indexing and interrupted-file recovery remain
+AVI indexing and interrupted-file recovery remain
 future work.
+
+## On-board playback implementation
+
+AVI parsing bounds every chunk against the declared file/movi lengths, checks
+word padding and PCM frame alignment, and rejects oversized JPEGs. SD chunks
+are streamed through an 8 KiB PCM staging buffer and bounded JPEG input;
+the whole recording is never loaded into RAM. Pure Rust `zune-jpeg` decodes
+on core 1 into RGB565 in PSRAM. A generation and frame index accompany every
+job, so STOP/restart cannot reuse an earlier session's image.
+
+Three decoded frames can be prefetched. The number of PCM bytes queued minus
+bytes remaining in I2S DMA determines the playback time and which frame is due.
+Playback pauses live DVP capture; changing tabs keeps the file playing and
+returning to CAMERA draws the current decoded frame. LCD painting defers while
+the decoder owns the mailbox, excluding simultaneous cache-heavy writes on
+both cores. Pending frame changes survive that deferral.
+
+Microphone draining was increased from 8 KiB to 32 KiB per loop, with the
+scratch buffer in PSRAM, and silent/tone TX fills all available 8 KiB blocks.
+This prevents a camera/radio-loaded loop from falling behind the 192000-byte/s
+capture stream. Combined Wi-Fi/BLE camera tests saved `VID00011.AVI` with
+166 frames and 6336512 audio bytes over about 33 seconds, and `VID00012.AVI`
+with 165 frames and 6335488 audio bytes. No additional microphone overruns
+occurred during those recordings; the combined build had one startup overrun.
+
+The first playback hardware build completed `VID00012.AVI` (all 165 frames),
+then passed STOP/restart and a second complete replay. Audio RX overruns stayed
+zero. That build accumulated LCD underruns during decoding, motivating the
+paint/decode exclusion added above; the revised build replayed all 165 frames with LCD underruns and RX overruns
+both staying zero. Its one TX underrun occurred before playback.
+Physical confirmation of motion, intelligible speech and A/V alignment remains
+pending. Automated console tests do not establish those perceptual checks.

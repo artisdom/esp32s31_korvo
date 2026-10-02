@@ -1,3 +1,5 @@
+use super::status;
+use core::sync::atomic::Ordering;
 use embassy_futures::{join::join, select::select};
 use embassy_time::Timer;
 use esp_hal::{peripherals::BT, rng::Rng};
@@ -92,6 +94,7 @@ pub async fn ble_task(bt: BT<'static>) {
                         continue;
                     }
                 };
+                status::BLE.store(1, Ordering::Relaxed);
                 println!("BLE advertising: Korvo-S31");
                 let connection = match advertiser.accept().await {
                     Ok(connection) => connection,
@@ -107,6 +110,7 @@ pub async fn ble_task(bt: BT<'static>) {
                         continue;
                     }
                 };
+                status::BLE.store(2, Ordering::Relaxed);
                 println!("BLE connected");
                 select(
                     async {
@@ -135,6 +139,7 @@ pub async fn ble_task(bt: BT<'static>) {
                     },
                 )
                 .await;
+                status::BLE.store(0, Ordering::Relaxed);
                 println!("BLE disconnected");
             }
         },

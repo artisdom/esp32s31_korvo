@@ -24,7 +24,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | WS2812 status LED | GPIO37 | `esp_hal::rmt` | **disabled at user request** — black latched once at startup; no animation or button feedback |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
 | USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
-| DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: paged SCCB + DVP RX, Rust JPEG and AVI | live 320x240 preview and MJPEG + stereo microphone AVI recording; SD file decoded on host |
+| DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: paged SCCB + DVP RX, Rust JPEG and AVI | live 320x240 preview and MJPEG + stereo microphone AVI recording; on-board AVI playback; SD file also decoded on host |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
 | Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: JPEG + USB tasks |
 | Wi-Fi 6 / BLE / 802.15.4 | modem | `esp-radio` | **optional builds** — scan + station/DHCP/TCP echo, BLE uptime GATT, 802.15.4/Zigbee beacon discovery; [status and limits](doc/16-radio-support.md) |
@@ -88,8 +88,9 @@ The onboard camera answers SCCB once the SoC drives its master clock:
 With that in place the board reports **SC101IOT, PID 0xda4a** (OV3660 is not
 populated on this unit). CAMERA now offers a 320x240 live preview and records
 MJPEG video plus 48 kHz stereo microphone audio together in numbered AVI files.
-Tap RECORD / SAVE or press SET; STOP saves before card removal. AVI files can
-be deleted in SD CARD and played on a computer. See
+Tap REC / SAVE or press SET; STOP saves before card removal. AVI files can
+be played with CAMERA PLAY / REPLAY LAST, opened with SD CARD PLAY FILE,
+deleted in SD CARD and played on a computer. See
 [camera video recording](doc/15-camera-video-recording.md) for controls,
 implementation, validation and limits.
 

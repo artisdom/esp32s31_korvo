@@ -1,5 +1,7 @@
 //! 802.15.4 active discovery on channels 11..26. A MAC Beacon Request discovers
 //! Zigbee PANs. Thread needs a full MLE/6LoWPAN stack, not just this PHY/MAC.
+use super::status;
+use core::sync::atomic::Ordering;
 use embassy_time::Timer;
 use esp_hal::peripherals::IEEE802154;
 use esp_println::println;
@@ -11,6 +13,7 @@ pub async fn ieee_task(peripheral: IEEE802154<'static>) {
     let mut sequence = 0u8;
     loop {
         for channel in 11..=26 {
+            status::CHANNEL.store(channel as u32, Ordering::Relaxed);
             radio.set_config(Config {
                 channel,
                 promiscuous: true,
@@ -35,6 +38,7 @@ pub async fn ieee_task(peripheral: IEEE802154<'static>) {
                 for _ in 0..4 {
                     match radio.received() {
                         Some(Ok(frame)) => {
+                            status::RECEIVED.fetch_add(1, Ordering::Relaxed);
                             if matches!(
                                 frame.frame.content,
                                 ieee802154::mac::FrameContent::Beacon(_)
@@ -42,6 +46,7 @@ pub async fn ieee_task(peripheral: IEEE802154<'static>) {
                                 if let Some(beacon) =
                                     super::beacon::ZigbeeBeacon::parse(&frame.frame.payload)
                                 {
+                                    status::ZIGBEE_BEACONS.fetch_add(1, Ordering::Relaxed);
                                     println!(
                                         "Zigbee PAN: ch {} source {:?} extended PAN {:016x} version {} depth {} router capacity {} end-device capacity {}",
                                         frame.channel,

@@ -109,19 +109,25 @@ impl Storage {
         Ok(Self { fs, root })
     }
     pub fn tracks(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
-        self.list_files(true)
+        self.list_files(1)
     }
     pub fn files(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
-        self.list_files(false)
+        self.list_files(0)
     }
-    fn list_files(&self, audio_only: bool) -> Result<heapless::Vec<Name, 64>, &'static str> {
+    pub fn videos(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
+        self.list_files(2)
+    }
+    fn list_files(&self, filter: u8) -> Result<heapless::Vec<Name, 64>, &'static str> {
         let mut out = heapless::Vec::new();
         self.fs
             .iterate_dir(self.root, |entry| {
                 if !entry.attributes.is_directory() && !entry.attributes.is_volume() {
                     let mut name = Name::new();
                     let _ = write!(name, "{}", entry.name);
-                    if !audio_only || name.ends_with(".WAV") || name.ends_with(".MP3") {
+                    if filter == 0
+                        || (filter == 1 && (name.ends_with(".WAV") || name.ends_with(".MP3")))
+                        || (filter == 2 && name.ends_with(".AVI"))
+                    {
                         let _ = out.push(name);
                     }
                 }

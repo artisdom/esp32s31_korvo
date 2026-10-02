@@ -1,15 +1,19 @@
-#[path = "../../../src/psram_buffer.rs"]
-mod psram_buffer;
-#[path = "../../../src/jpeg_worker.rs"]
-mod jpeg_worker;
 #[path = "../../../src/avi.rs"]
 mod avi;
+#[path = "../../../src/avi_playback.rs"]
+mod avi_playback;
 #[path = "../../../src/delete_request.rs"]
 mod delete_request;
 #[path = "../../../src/fat_layout.rs"]
 mod fat_layout;
+#[path = "../../../src/jpeg_decoder.rs"]
+mod jpeg_decoder;
+#[path = "../../../src/jpeg_worker.rs"]
+mod jpeg_worker;
 #[path = "../../../src/pcm.rs"]
 mod pcm;
+#[path = "../../../src/psram_buffer.rs"]
+mod psram_buffer;
 #[cfg(test)]
 mod integration {
     use super::*;
@@ -277,22 +281,41 @@ mod integration {
     fn avi_video_and_pcm_audio_decode_with_matching_durations() {
         let path = std::env::temp_dir().join(format!("korvo-avi-{}.avi", std::process::id()));
         let frames = 5;
-        let mut image = vec![0;avi::FRAME_BYTES];
-        for pair in image.chunks_exact_mut(4) { pair.copy_from_slice(&[128,16,128,235]); }
-        assert_eq!(avi::rgb565(&image,0,0),0);
-        assert_eq!(avi::rgb565(&image,1,0),0xffff);
+        let mut image = vec![0; avi::FRAME_BYTES];
+        for pair in image.chunks_exact_mut(4) {
+            pair.copy_from_slice(&[128, 16, 128, 235]);
+        }
+        assert_eq!(avi::rgb565(&image, 0, 0), 0);
+        assert_eq!(avi::rgb565(&image, 1, 0), 0xffff);
         let mut jpeg = Vec::new();
-        avi::encode_jpeg(&image,&mut vec![0;avi::WIDTH*avi::HEIGHT*3],&mut jpeg).unwrap();
-        assert!(jpeg.starts_with(&[0xff,0xd8]) && jpeg.ends_with(&[0xff,0xd9]));
+        avi::encode_jpeg(
+            &image,
+            &mut vec![0; avi::WIDTH * avi::HEIGHT * 3],
+            &mut jpeg,
+        )
+        .unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9]));
         // Exercise odd-sized compressed chunks, even when the encoder happens
         // to generate an even-sized JPEG. Decoders accept trailing zero bytes.
-        if jpeg.len() & 1 == 0 { jpeg.push(0); }
-        let movi_bytes = frames*(jpeg.len() as u32 + 1 + 8 + 38400 + 8);
+        if jpeg.len() & 1 == 0 {
+            jpeg.push(0);
+        }
+        let movi_bytes = frames * (jpeg.len() as u32 + 1 + 8 + 38400 + 8);
         let mut f = File::create(&path).unwrap();
-        f.write_all(&avi::header(avi::HEADER_BYTES as u32+movi_bytes,frames,192000,movi_bytes)).unwrap();
+        f.write_all(&avi::header(
+            avi::HEADER_BYTES as u32 + movi_bytes,
+            frames,
+            192000,
+            movi_bytes,
+        ))
+        .unwrap();
         for _ in 0..frames {
-            f.write_all(&avi::chunk_header(true,jpeg.len() as u32)).unwrap(); f.write_all(&jpeg).unwrap(); f.write_all(&[0]).unwrap();
-            f.write_all(&avi::chunk_header(false,38400)).unwrap(); f.write_all(&vec![0;38400]).unwrap();
+            f.write_all(&avi::chunk_header(true, jpeg.len() as u32))
+                .unwrap();
+            f.write_all(&jpeg).unwrap();
+            f.write_all(&[0]).unwrap();
+            f.write_all(&avi::chunk_header(false, 38400)).unwrap();
+            f.write_all(&vec![0; 38400]).unwrap();
         }
         drop(f);
         let probe = Command::new("ffprobe")
@@ -374,16 +397,22 @@ mod integration {
 
 #[test]
 fn jpeg_mailbox_owns_buffers_across_threads_and_preserves_generation() {
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     let worker = Arc::new(jpeg_worker::Worker::new());
     let done = Arc::new(AtomicBool::new(false));
     let encoding = worker.clone();
     let stop = done.clone();
     let encoder = std::thread::spawn(move || {
-        while !stop.load(Ordering::Acquire) { encoding.encode(); std::thread::yield_now(); }
+        while !stop.load(Ordering::Acquire) {
+            encoding.encode();
+            std::thread::yield_now();
+        }
     });
     let frame = [128, 16, 128, 235].repeat(avi::FRAME_BYTES / 4);
-    assert!(!worker.submit(&frame[..frame.len()-1], 999));
+    assert!(!worker.submit(&frame[..frame.len() - 1], 999));
     assert!(worker.take().is_none());
     for generation in 1..=8 {
         assert!(worker.submit(&frame, generation));
@@ -393,8 +422,8 @@ fn jpeg_mailbox_owns_buffers_across_threads_and_preserves_generation() {
             if let Some((id, jpeg)) = worker.take() {
                 assert_eq!(id, generation);
                 let jpeg = jpeg.unwrap();
-                assert_eq!(&jpeg[..2], &[255,216]);
-                assert_eq!(&jpeg[jpeg.len()-2..], &[255,217]);
+                assert_eq!(&jpeg[..2], &[255, 216]);
+                assert_eq!(&jpeg[jpeg.len() - 2..], &[255, 217]);
                 break;
             }
             assert!(std::time::Instant::now() < deadline);
@@ -403,4 +432,139 @@ fn jpeg_mailbox_owns_buffers_across_threads_and_preserves_generation() {
     }
     done.store(true, Ordering::Release);
     encoder.join().unwrap();
+}
+
+#[test]
+fn playback_rejects_unfinished_wrong_format_and_invalid_chunks() {
+    use avi_playback::{Chunk, Format, Kind};
+    let size = avi::HEADER_BYTES as u32 + 1234;
+    let header = avi::header(size, 5, 192000, 1234);
+    let f = Format::parse(&header, size).unwrap();
+    assert_eq!((f.end, f.frames, f.audio_bytes), (size, 5, 192000));
+    assert!(Format::parse(&header, size - 1).is_err());
+    assert!(Format::parse(&header[..323], size).is_err());
+    for (offset, value) in [
+        (112, b'X'),
+        (176, 0),
+        (298, 1),
+        (300, 0),
+        (310, 8),
+        (140, 4),
+    ] {
+        let mut bad = header;
+        bad[offset] = value;
+        assert!(Format::parse(&bad, size).is_err(), "offset {offset}");
+    }
+    assert!(Format::parse(&avi::header(324, 0, 0, 0), 324).is_err());
+    let odd = Chunk::parse(&avi::chunk_header(true, 9), 324, 342).unwrap();
+    assert_eq!((odd.kind, odd.bytes, odd.next), (Kind::Video, 9, 342));
+    assert!(Chunk::parse(&avi::chunk_header(true, 9), 324, 341).is_err());
+    assert!(Chunk::parse(&avi::chunk_header(true, 0), 324, 400).is_err());
+    assert!(Chunk::parse(&avi::chunk_header(true, u32::MAX), 324, u32::MAX).is_err());
+    assert!(Chunk::parse(&avi::chunk_header(false, 3), 324, 400).is_err());
+    assert!(
+        Chunk::parse(
+            &avi::chunk_header(true, avi::FRAME_BYTES as u32 + 1),
+            0,
+            u32::MAX
+        )
+        .is_err()
+    );
+}
+#[test]
+fn jpeg_playback_decodes_colours_and_bounds_mailbox_across_threads() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let mut rgb = vec![0u8; avi::WIDTH * avi::HEIGHT * 3];
+    for (index, pixel) in rgb.chunks_exact_mut(3).enumerate() {
+        pixel.copy_from_slice(if index % avi::WIDTH < avi::WIDTH / 2 {
+            &[255, 0, 0]
+        } else {
+            &[0, 0, 255]
+        });
+    }
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 90)
+        .encode(
+            &rgb,
+            avi::WIDTH as u16,
+            avi::HEIGHT as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .unwrap();
+    let worker = Arc::new(jpeg_decoder::Worker::new());
+    let done = Arc::new(AtomicBool::new(false));
+    let decoding = worker.clone();
+    let stop = done.clone();
+    let decoder = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            decoding.run();
+            std::thread::yield_now();
+        }
+    });
+    assert!(!worker.submit(&[], 1, 0));
+    assert!(!worker.submit(&vec![0; avi::FRAME_BYTES + 1], 1, 0));
+    for generation in 1..=5 {
+        let input = if generation == 3 {
+            b"broken JPEG".as_slice()
+        } else {
+            &jpeg
+        };
+        assert!(worker.submit(input, generation, generation + 8));
+        assert!(!worker.submit(&jpeg, 999, 0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some((id, index, output)) = worker.take() {
+                assert_eq!((id, index), (generation, generation + 8));
+                if generation == 3 {
+                    assert!(output.is_err());
+                } else {
+                    let image = output.unwrap();
+                    assert_eq!(image.len(), avi::FRAME_BYTES);
+                    let red = u16::from_le_bytes(image[40..42].try_into().unwrap());
+                    let blue = u16::from_le_bytes(image[600..602].try_into().unwrap());
+                    assert!(red & 0xf800 >= 0xf000 && red & 0x1f < 4, "{red:x}");
+                    assert!(blue & 0x1f >= 28 && blue & 0xf800 < 0x1000, "{blue:x}");
+                }
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+    done.store(true, Ordering::Release);
+    decoder.join().unwrap();
+    let mut oversized = Vec::new();
+    jpeg_encoder::Encoder::new(&mut oversized, 45)
+        .encode(
+            &vec![0; 321 * 240 * 3],
+            321,
+            240,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .unwrap();
+    assert!(jpeg_decoder::decode(&oversized, &mut rgb, &mut vec![0; avi::FRAME_BYTES]).is_err());
+}
+
+#[test]
+fn lcd_paint_preserves_queued_and_ready_decode_jobs() {
+    let worker = jpeg_decoder::Worker::new();
+    assert!(worker.paint(|| {
+        assert!(!worker.submit(b"invalid", 1, 0));
+    }));
+    assert!(worker.submit(b"invalid", 7, 42));
+    assert!(worker.paint(|| {
+        worker.run();
+        assert!(worker.take().is_none());
+    }));
+    worker.run();
+    assert!(worker.paint(|| {
+        assert!(worker.take().is_none());
+    }));
+    let (generation, index, result) = worker.take().unwrap();
+    assert_eq!((generation, index), (7, 42));
+    assert!(result.is_err());
+    assert!(worker.idle());
 }

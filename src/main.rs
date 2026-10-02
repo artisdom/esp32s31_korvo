@@ -29,6 +29,7 @@ use static_cell::StaticCell;
 mod audio;
 mod audio_ring;
 mod avi;
+mod avi_playback;
 mod board;
 mod button_logic;
 mod buttons;
@@ -41,6 +42,7 @@ mod es8389;
 mod fat_layout;
 mod font;
 mod gfx;
+mod jpeg_decoder;
 mod jpeg_worker;
 mod led;
 mod media;
@@ -55,6 +57,7 @@ mod touch;
 mod touch_action;
 mod ui;
 mod usb;
+mod video_player;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -319,7 +322,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
     });
     static JPEG_WORKER: StaticCell<jpeg_worker::Worker> = StaticCell::new();
     let encoder = &*JPEG_WORKER.init(jpeg_worker::Worker::new());
-    let mut media = media::Media::new(storage, encoder);
+    static JPEG_DECODER: StaticCell<jpeg_decoder::Worker> = StaticCell::new();
+    let decoder = &*JPEG_DECODER.init(jpeg_decoder::Worker::new());
+    let mut media = media::Media::new(storage, encoder, decoder);
 
     // --- buttons -------------------------------------------------------------------------------
     let mut buttons = buttons::Buttons::new(peripherals.ADC1, peripherals.GPIO42);
@@ -336,7 +341,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
         executor.run(|spawner| {
             spawner.spawn(usb::usb_task(usb_hs).expect("spawn usb"));
-            spawner.spawn(jpeg_task(encoder).expect("spawn JPEG"));
+            spawner.spawn(jpeg_task(encoder, decoder).expect("spawn JPEG"));
         });
     });
     step("core1 usb task");
@@ -370,6 +375,10 @@ async fn main(_spawner: embassy_executor::Spawner) {
         media_seconds: 0,
         recording: false,
         video_recording: false,
+        video_playing: false,
+        video_selected: heapless::String::new(),
+        video_count: 0,
+        video_index: 0,
         video_name: heapless::String::new(),
         video_frames: 0,
         camera_frames: 0,
@@ -401,7 +410,16 @@ async fn main(_spawner: embassy_executor::Spawner) {
         LOOP_COUNT.fetch_add(1, Ordering::Relaxed);
 
         if let Some(cmd) = console.poll() {
-            st.page = if matches!(cmd, media::Command::VideoRecord) {
+            st.page = if matches!(
+                cmd,
+                media::Command::VideoRecord
+                    | media::Command::VideoPlay
+                    | media::Command::VideoReplay
+                    | media::Command::VideoNext
+                    | media::Command::VideoPrevious
+            ) || (matches!(cmd, media::Command::PlayFile)
+                && media.selected_file_video())
+            {
                 Page::Camera
             } else {
                 Page::Audio
@@ -463,6 +481,13 @@ async fn main(_spawner: embassy_executor::Spawner) {
                     if let Some(cmd) =
                         ui::hit_media(st.page, x, y, media.delete_request.name().is_some())
                     {
+                        if matches!(cmd, media::Command::PlayFile) {
+                            st.page = if media.selected_file_video() {
+                                Page::Camera
+                            } else {
+                                Page::Audio
+                            };
+                        }
                         media.command(cmd, &mut audio);
                     }
                 }
@@ -487,7 +512,11 @@ async fn main(_spawner: embassy_executor::Spawner) {
         let camera_new_frame = camera_stream
             .as_mut()
             .map(|camera| {
-                camera.poll(!repaint_page && (st.page == Page::Camera || media.video_recording()))
+                camera.poll(
+                    !repaint_page
+                        && !media.video_playing()
+                        && (st.page == Page::Camera || media.video_recording()),
+                )
             })
             .unwrap_or(false);
         if let Some(camera) = camera_stream.as_ref() {
@@ -514,6 +543,11 @@ async fn main(_spawner: embassy_executor::Spawner) {
         st.media_seconds = media.seconds;
         st.recording = media.recording();
         st.video_recording = media.video_recording();
+        st.video_playing = media.video_playing();
+        st.video_selected.clear();
+        let _ = st.video_selected.push_str(media.selected_video());
+        st.video_count = media.videos.len();
+        st.video_index = media.video_selected;
         st.video_name = media.video_name.clone();
         st.video_frames = media.video_frames;
         st.camera_frames = camera_stream.as_ref().map(|c| c.count).unwrap_or(0);
@@ -533,21 +567,34 @@ async fn main(_spawner: embassy_executor::Spawner) {
         // Full redraw only when the page changes; otherwise repaint just
         // the dynamic widgets and cache-clean those regions (a full-frame
         // clean every tick starves the LCD DMA and the panel rolls).
-        if shown_page != st.page {
-            shown_page = st.page;
-            ui::draw(&mut display.canvas(), &st);
-            display.flush();
-        } else if dyn_tick.elapsed().as_millis() >= 50 {
-            dyn_tick = Instant::now();
-            let dirty = ui::draw_dynamic(&mut display.canvas(), &st);
-            display.flush_rects(&dirty.as_slice());
-        }
-
-        if st.page == Page::Camera && camera_new_frame {
-            if let Some(camera) = camera_stream.as_ref() {
-                ui::draw_camera_frame(&mut display.canvas(), &camera.frame);
-                display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
+        if decoder.paint(|| {
+            if shown_page != st.page {
+                shown_page = st.page;
+                ui::draw(&mut display.canvas(), &st);
+                display.flush();
+            } else if dyn_tick.elapsed().as_millis() >= 50 {
+                dyn_tick = Instant::now();
+                let dirty = ui::draw_dynamic(&mut display.canvas(), &st);
+                display.flush_rects(&dirty.as_slice());
             }
+
+            if st.page == Page::Camera
+                && media.video_playing()
+                && (media.playback_changed() || repaint_page)
+            {
+                if let Some(image) = media.playback_frame() {
+                    ui::draw_playback_frame(&mut display.canvas(), image);
+                    display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
+                }
+            }
+            if st.page == Page::Camera && !media.video_playing() && camera_new_frame {
+                if let Some(camera) = camera_stream.as_ref() {
+                    ui::draw_camera_frame(&mut display.canvas(), &camera.frame);
+                    display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
+                }
+            }
+        }) {
+            media.frame_presented();
         }
         st.led_rgb = (0, 0, 0); // LED intentionally disabled.
 
@@ -599,9 +646,10 @@ fn alloc_fb() -> Option<&'static mut [u8]> {
 }
 
 #[embassy_executor::task]
-async fn jpeg_task(worker: &'static jpeg_worker::Worker) {
+async fn jpeg_task(worker: &'static jpeg_worker::Worker, decoder: &'static jpeg_decoder::Worker) {
     loop {
         worker.encode();
+        decoder.run();
         embassy_time::Timer::after_millis(2).await;
     }
 }

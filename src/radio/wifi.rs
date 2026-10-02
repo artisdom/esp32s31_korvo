@@ -1,3 +1,5 @@
+use super::status;
+use core::sync::atomic::Ordering;
 use embassy_futures::join::join3;
 use embassy_net::{StackResources, tcp::TcpSocket};
 use embassy_time::{Duration, Timer};
@@ -39,6 +41,7 @@ pub async fn wifi_task(wifi: WIFI<'static>) {
         wifi,
         ControllerConfig::default().with_initial_config(Config::Station(station)),
     ) else {
+        status::WIFI.store(6, Ordering::Relaxed);
         println!("Wi-Fi: controller initialization failed");
         return;
     };
@@ -65,13 +68,19 @@ pub async fn wifi_task(wifi: WIFI<'static>) {
         runner.run(),
         async {
             loop {
+                status::WIFI.store(3, Ordering::Relaxed);
                 match controller.connect_async().await {
                     Ok(info) => {
+                        status::WIFI.store(4, Ordering::Relaxed);
                         println!("Wi-Fi connected: {:?}", info);
                         let _ = controller.wait_for_disconnect_async().await;
+                        status::WIFI.store(3, Ordering::Relaxed);
                         println!("Wi-Fi disconnected; retrying");
                     }
-                    Err(error) => println!("Wi-Fi connect failed: {:?}", error),
+                    Err(error) => {
+                        status::WIFI.store(6, Ordering::Relaxed);
+                        println!("Wi-Fi connect failed: {:?}", error);
+                    }
                 }
                 Timer::after_secs(5).await;
             }
@@ -83,6 +92,7 @@ pub async fn wifi_task(wifi: WIFI<'static>) {
             loop {
                 stack.wait_config_up().await;
                 if let Some(config) = stack.config_v4() {
+                    status::WIFI.store(5, Ordering::Relaxed);
                     println!("Wi-Fi DHCP: {}; TCP echo port 2323", config.address);
                 }
                 let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
@@ -115,8 +125,11 @@ pub async fn wifi_task(wifi: WIFI<'static>) {
     .await;
 }
 async fn print_scan(controller: &mut WifiController<'_>, scan: &ScanConfig) {
+    status::WIFI.store(1, Ordering::Relaxed);
     match controller.scan_async(scan).await {
         Ok(aps) => {
+            status::WIFI.store(2, Ordering::Relaxed);
+            status::APS.store(aps.len() as u32, Ordering::Relaxed);
             println!("Wi-Fi scan: {} networks", aps.len());
             for ap in aps {
                 println!(

@@ -1,0 +1,12 @@
+diff --git a/build.rs b/build.rs
+index 1ec51d5..67bbdbf 100644
+--- a/build.rs
++++ b/build.rs
+@@ -6,6 +6,7 @@ fn main() {
+ 
+     let libs = [
+         "ble_app",
++        "bredr_app",
+         "btdm_common",
+         "btbb",
+         "coexist",

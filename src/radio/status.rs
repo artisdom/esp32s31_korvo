@@ -15,3 +15,8 @@ pub static ZIGBEE_BEACONS: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(feature = "radio-zigbee")]
 pub static ZIGBEE: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "radio-classic")]
+pub static CLASSIC: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "radio-classic")]
+pub static CLASSIC_REPORTS: AtomicU32 = AtomicU32::new(0);

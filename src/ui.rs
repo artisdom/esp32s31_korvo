@@ -454,6 +454,32 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
                 1,
             );
         }
+        #[cfg(feature = "radio-classic")]
+        {
+            use crate::radio::status;
+            use core::sync::atomic::Ordering;
+            let phase = match status::CLASSIC.load(Ordering::Relaxed) {
+                1 => "Classic: inquiry scanning",
+                2 => "Classic: waiting for next scan",
+                3 => "Classic error / check UART",
+                _ => "Classic starting",
+            };
+            c.text(card.x + 12, card.y + 120, phase, gfx::SKY, 1);
+            let mut counts = heapless::String::<40>::new();
+            let _ = write!(
+                counts,
+                "Inquiry reports: {}",
+                status::CLASSIC_REPORTS.load(Ordering::Relaxed)
+            );
+            c.text(card.x + 12, card.y + 138, &counts, gfx::TEXT, 1);
+            c.text(
+                card.x + 12,
+                card.y + 156,
+                "Discovery / no pairing",
+                gfx::MUTED,
+                1,
+            );
+        }
         #[cfg(feature = "radio-zigbee")]
         {
             use core::sync::atomic::Ordering;
@@ -477,7 +503,8 @@ fn page_home_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         #[cfg(not(any(
             feature = "radio-wifi-ble",
             feature = "radio-802154",
-            feature = "radio-zigbee"
+            feature = "radio-zigbee",
+            feature = "radio-classic"
         )))]
         c.text(
             card.x + 12,

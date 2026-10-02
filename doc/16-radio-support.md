@@ -2,11 +2,14 @@
 
 The S31 silicon supports 2.4 GHz Wi-Fi 6, Bluetooth 5.4 LE, Bluetooth Classic,
 Zigbee 3.0 and Thread 1.4. The Rust application now has optional Wi-Fi/BLE,
-802.15.4 discovery and experimental Zigbee commissioning builds. These are separate from the default media build.
+Classic inquiry, 802.15.4 discovery and experimental Zigbee commissioning
+builds. These are separate from the default media build.
 Wi-Fi scan/association/DHCP/TCP echo and BLE GATT have now passed hardware
 checks on this board. DHCP is intermittent across resets and remains under
 investigation; Wi-Fi 6 negotiation has not been verified with an AX access point.
-802.15.4 discovery and Zigbee commissioning are currently build-tested only.
+Classic inquiry has discovered the laptop over the air. 802.15.4 discovery
+scanned all channels and received a Zigbee beacon on channel 20. Zigbee
+commissioning remains build-tested only.
 
 ## What is implemented
 
@@ -14,10 +17,10 @@ investigation; Wi-Fi 6 negotiation has not been verified with an AX access point
 | --- | --- | --- |
 | Wi-Fi | 2.4 GHz B/G/N/**AX explicitly enabled**, scan with channel/RSSI; optional station connection, DHCP and TCP echo on port 2323 | Hardware scan/association/DHCP/echo passed; intermittent DHCP across resets; AX negotiation needs a compatible access point |
 | Bluetooth LE | Connectable `Korvo-S31` advertising, custom GATT service with readable/notifiable uptime in seconds | Host adapter discovered and connected, read uptime and received five notifications; phone testing remains |
-| IEEE 802.15.4 | Channel 11–26 active discovery, MAC beacon requests, received frame channel/RSSI/LQI; identifies Zigbee PRO beacon extended PAN and capacity | Receive beacons from a nearby coordinator; test TX/RX with a second radio |
+| IEEE 802.15.4 | Channel 11–26 active discovery, MAC beacon requests, received frame channel/RSSI/LQI; identifies Zigbee PRO beacon extended PAN and capacity | Board scan completed and decoded a coordinator beacon on channel 20; controlled peer TX/RX and network joining still need validation |
 | Zigbee | Beacon discovery; separate experimental end-device commissioning build with security, persistence, Basic/Identify interview and parent maintenance | Joining/interview/reset must be tested with a real coordinator |
 | Thread | Available 802.15.4 PHY/MAC; no Thread host stack | MLE, 6LoWPAN, IPv6 routing, commissioning and network dataset support are not implemented |
-| Bluetooth Classic | Supported by hardware; unavailable in this application's Rust controller interface | The local esp-radio adapter enables BLE only; Classic controller mode and BR/EDR host/profile stack need implementation |
+| Bluetooth Classic | Experimental `radio-classic` build: dual-mode controller plus Rust HCI GIAC inquiry with RSSI; HOME scan/report status | Board discovered laptop and completed inquiry with status zero; pairing, connections, SPP/A2DP/HFP and other host profiles remain unimplemented |
 
 The BLE demo uses legacy advertising and GATT. It does not imply implementation
 of every optional Bluetooth 5.4 feature, LE Audio or Classic audio profiles.
@@ -37,6 +40,9 @@ cargo build --release --features radio-wifi-ble
 # Also connect to an access point (credentials become part of this firmware):
 KORVO_WIFI_SSID='your-ssid' KORVO_WIFI_PASSWORD='your-password' \
   cargo build --release --features radio-wifi-ble
+
+# Alternative radio build: Bluetooth Classic inquiry (no pairing):
+cargo build --release --features radio-classic
 
 # Alternative radio build: discover 802.15.4/Zigbee beacons:
 cargo build --release --features radio-802154
@@ -83,14 +89,15 @@ rustc --edition=2024 --test src/radio_beacon.rs -o /tmp/korvo-beacon-tests
 ## Integration constraints
 
 The current local `esp-radio/build.rs` rejects Wi-Fi and IEEE 802.15.4 enabled
-together, so **choose one radio feature**, never combine them. Wi-Fi and BLE use the
+together, so **choose one radio feature**, never combine them. Classic inquiry
+also has its own build, separate from Wi-Fi/BLE and both 802.15.4 applications. Wi-Fi and BLE use the
 upstream coexistence feature. Radio tasks run on the core 0 Embassy executor;
 core 1 remains available for USB and camera compression. Network waits yield,
 and scan reporting yields between access points to avoid a long UART print
 blocking microphone servicing. Hardware tests must check microphone overrun
 counters and display DMA underruns while scanning and transferring data.
 
-The Wi-Fi/BLE build has 112 KiB of internal heap split into a 64 KiB reclaimed
+The Wi-Fi/BLE and Classic builds have 112 KiB of internal heap split into a 64 KiB reclaimed
 region and the existing 48 KiB region. Splitting regions prevents a 150 KiB
 camera frame from consuming the radio's internal heap. A short startup yield
 lets radio controller allocations occur before media buffers are allocated.
@@ -106,7 +113,7 @@ introduce ESP-IDF, C application code, Bluedroid or C++ OpenThread.
 ## Primary sources and next steps
 
 - [Espressif S31 datasheet](https://documentation.espressif.com/esp32-s31_datasheet_en.html): silicon capabilities, including Classic BR/EDR.
-- [esp-radio source](https://github.com/esp-rs/esp-hal/tree/main/esp-radio): current local target support and API. The local S31 BLE adapter in `src/ble/btdm2/os_adapter_esp32s31.rs` selects BLE mode and leaves BR/EDR configuration empty; `src/ble/btdm2/mod.rs` enables BLE explicitly.
+- [esp-radio source](https://github.com/esp-rs/esp-hal/tree/main/esp-radio): current local target support and API. The local S31 adapter selects BLE mode by default; our optional `classic` driver patch configures and initializes dual-mode BR/EDR discovery.
 - [TrouBLE](https://github.com/embassy-rs/trouble): Rust BLE host and GATT implementation.
 - [zigbee-rs](https://github.com/zigbee-rs/zigbee-rs): an actual Rust Zigbee stack with discovery and end-device steering examples. Its upstream ESP adapter targets C6/C5/H2; our small S31 manifest port and commissioning demo are described below. Secure commissioning still needs board/coordinator validation.
 - [OpenThread](https://github.com/openthread/openthread): a full Thread implementation in C/C++. Wrapping it in Rust would not meet a strict Rust host-stack requirement.
@@ -249,3 +256,87 @@ A new 55-frame camera/microphone recording then saved and replayed cleanly in
 this build, without additional recording/playback DMA faults. Earlier DHCP
 and CPU-lockup observations are retained as experimental-driver limitations;
 these successful checks do not establish long-duration reliability.
+
+## Experimental Bluetooth Classic inquiry
+
+This is a Rust discovery application, not a Classic connection/profile stack.
+It issues HCI Reset, Write Inquiry Mode (RSSI), then a 5.12-second GIAC inquiry,
+waiting for each command's completion/status. It reports inquiry payloads on
+UART, scan state/report count on HOME, and repeats after 30 seconds. Put a
+peer into discoverable mode. Reports may repeat for the same address; the
+counter is not a count of unique devices. No ACL/SCO connections or pairing
+are initiated. ECDH callbacks explicitly fail; A2DP, HFP and SPP are absent.
+
+The published `esp-wifi-sys-esp32s31` **0.3.0** crate already ships
+`libbredr_app.a`, but its build script omits the library. Our local SDK copy
+links it alongside that same package's BLE/common/PHY archives. The controller
+expects the older `0x20250327` configuration layout and event `tx_done/free`
+ABI. Do not mix newer ESP-IDF controller libraries into this package. The
+local SDK dependency is `/home/nws/w/esp32/esp-rs/esp-wifi-sys-s31-classic`,
+commit `10ffa39`; the shared HAL driver patch is commit `233478051`.
+
+Rust SHA256/HMAC and RustCrypto P-192/P-256 initialization callbacks replace
+the vendor C crypto adapter. RF entropy supplies secret scalars; zero/out-of-
+range values are retried with a bound and temporary secrets are zeroized.
+Public coordinates and private scalars use the controller's little-endian ABI.
+P-192 is used only to satisfy legacy controller initialization; this does not
+enable secure pairing. Packet allocations must stay inside the controller's
+reserved SRAM pool. A coalescing Rust allocator provides that pool; allocating
+from the global heap causes the controller's ownership assertion to fail.
+
+Reproduce these dependency changes before resolving/building this checkout:
+
+```sh
+scripts/apply-btdm-memory-fix.sh /home/nws/w/esp32/esp-rs/esp-hal
+scripts/setup-classic-s31.sh
+cargo build --release --features radio-classic
+```
+
+The setup script downloads the SDK crate only when its destination is absent,
+checks the package checksum pinned in the original Cargo.lock, then applies
+`patches/esp-wifi-sys-s31-classic.patch` and
+`patches/esp-radio-classic-s31.patch`. Already-applied patches are detected.
+It checks patches before applying and never substitutes newer binary archives.
+Commit the applied patches in those dependency checkouts. Optional arguments
+select other HAL/SDK paths; Cargo.toml paths must then be updated to match.
+
+The standalone production-callback checks run without the board:
+
+```sh
+cargo test --manifest-path /home/nws/w/esp32/esp-rs/esp-hal/esp-radio/tests/classic-host/Cargo.toml \
+  --target x86_64-unknown-linux-gnu
+```
+
+Three tests cover published curve generator vectors in controller byte order,
+bounded invalid-entropy rejection, and 256 mixed packet allocation/free cycles
+with alignment, reserved-pool bounds, exhaustion and coalescing checks. The
+inquiry hardware check received RSSI events for laptop `00:1A:7D:DA:71:15`
+and completed with status zero. These checks do not validate pairing or profiles.
+
+The integrated Classic build also replayed `VID00013.AVI` (55 frames) with
+all frames decoded, none skipped, zero LCD underruns and no additional I2S
+faults during playback. It completed two inquiry cycles. The dependency
+setup script was checked against a fresh checksum-verified SDK package and
+reconstructed pre-patch HAL files, then run again to verify idempotence.
+Default, Wi-Fi/BLE, Classic, 802.15.4 and configured Zigbee release builds
+compile/link with the shared driver changes; all 18 media host tests still pass.
+
+## 802.15.4 discovery hardware check
+
+The board queued MAC beacon requests across channels 11–26 and completed the
+scan. On channel 20 it decoded a Zigbee PRO coordinator beacon, including
+extended PAN, capacity flags and receive RSSI/LQI (the observed frame was
+-79 dBm, LQI 5). Two other received frames produced bounded parser errors
+(`BadInput`, `Incomplete`) and scanning continued. No controller panic occurred;
+LCD underruns stayed zero and the I2S counters stayed at their startup baseline.
+This demonstrates discovery reception, not successful Zigbee/Thread joining or
+controlled bidirectional interoperability. A coordinator owned/configured for
+this project is still needed to validate commissioning and persistence.
+
+After integrating the shared Classic driver/SDK patch, the restored Wi-Fi/BLE
+firmware repeated the 33-second `VID00012.AVI` coexistence check: all 165 frames
+decoded, zero skipped images and zero LCD underruns. Ten TCP echo payloads
+and a GATT read plus five notifications passed during playback. I2S TX/RX
+fault counters remained at their startup baseline through completion. This
+Wi-Fi/BLE camera-playback build is installed on `/dev/ttyUSB0`; Classic and
+802.15.4 remain separate selectable firmware builds.

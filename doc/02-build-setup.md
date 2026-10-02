@@ -145,3 +145,13 @@ For a compatible fresh HAL checkout, run
 The app disables esp-alloc's default global allocator and supplies one that
 places JPEG worker allocations on core 1 in PSRAM; the HAL heap still provides
 explicit internal controller/DMA allocations and owns all deallocations.
+
+## Optional Classic discovery dependencies
+
+The root Cargo patch points at a local copy of the checksum-pinned
+`esp-wifi-sys-esp32s31` 0.3.0 package. Run `scripts/setup-classic-s31.sh` to
+recreate it and apply the optional BR/EDR driver patch to the shared HAL.
+Run `scripts/apply-btdm-memory-fix.sh` first on a fresh compatible HAL checkout.
+The setup is also required for Cargo dependency resolution when radios are
+not enabled. See [radio support](16-radio-support.md) for commits, tests and
+Classic discovery limits. No newer IDF binary archives are substituted.

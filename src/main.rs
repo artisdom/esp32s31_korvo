@@ -52,7 +52,8 @@ mod psram_buffer;
 #[cfg(any(
     feature = "radio-wifi-ble",
     feature = "radio-802154",
-    feature = "radio-zigbee"
+    feature = "radio-zigbee",
+    feature = "radio-classic"
 ))]
 mod radio;
 mod sc101iot_regs;
@@ -91,9 +92,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
     println!("chip: {}", esp_hal::chip!());
 
     // --- heaps: internal DRAM + PSRAM regions --------------------------------
-    #[cfg(not(feature = "radio-wifi-ble"))]
+    #[cfg(not(any(feature = "radio-wifi-ble", feature = "radio-classic")))]
     esp_alloc::heap_allocator!(size: 48 * 1024);
-    #[cfg(feature = "radio-wifi-ble")]
+    #[cfg(any(feature = "radio-wifi-ble", feature = "radio-classic"))]
     {
         // Two regions keep large camera buffers in PSRAM: a 150 KiB frame
         // cannot fit either internal allocation, while radio control blocks can.
@@ -120,6 +121,8 @@ async fn main(_spawner: embassy_executor::Spawner) {
     _spawner.spawn(radio::wifi_task(peripherals.WIFI).expect("spawn Wi-Fi"));
     #[cfg(feature = "radio-wifi-ble")]
     _spawner.spawn(radio::ble_task(peripherals.BT).expect("spawn BLE"));
+    #[cfg(feature = "radio-classic")]
+    _spawner.spawn(radio::classic_task(peripherals.BT).expect("spawn Classic"));
     #[cfg(feature = "radio-802154")]
     _spawner.spawn(radio::ieee_task(peripherals.IEEE802154).expect("spawn 802.15.4"));
     #[cfg(feature = "radio-zigbee")]
@@ -129,7 +132,8 @@ async fn main(_spawner: embassy_executor::Spawner) {
     #[cfg(any(
         feature = "radio-wifi-ble",
         feature = "radio-802154",
-        feature = "radio-zigbee"
+        feature = "radio-zigbee",
+        feature = "radio-classic"
     ))]
     Timer::after_millis(100).await;
     // --- RGB LCD + PSRAM framebuffer ---------------------------------------------------

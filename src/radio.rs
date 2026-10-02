@@ -3,9 +3,12 @@
 #[cfg(any(
     all(feature = "radio-wifi-ble", feature = "radio-802154"),
     all(feature = "radio-wifi-ble", feature = "radio-zigbee"),
-    all(feature = "radio-802154", feature = "radio-zigbee")
+    all(feature = "radio-802154", feature = "radio-zigbee"),
+    all(feature = "radio-classic", feature = "radio-wifi-ble"),
+    all(feature = "radio-classic", feature = "radio-802154"),
+    all(feature = "radio-classic", feature = "radio-zigbee")
 ))]
-compile_error!("Select radio-wifi-ble OR radio-802154, not both");
+compile_error!("Select exactly one radio demo feature");
 #[cfg(feature = "radio-802154")]
 #[path = "radio_beacon.rs"]
 mod beacon;
@@ -30,3 +33,8 @@ pub use zigbee_demo::zigbee_task;
 #[cfg(feature = "radio-zigbee")]
 #[path = "zigbee_partition.rs"]
 mod partition;
+
+#[cfg(feature = "radio-classic")]
+mod classic_demo;
+#[cfg(feature = "radio-classic")]
+pub use classic_demo::classic_task;

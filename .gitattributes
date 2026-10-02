@@ -1,0 +1,2 @@
+# Unified-diff context and the SDK CRLF payload must remain byte-exact.
+patches/*.patch -whitespace

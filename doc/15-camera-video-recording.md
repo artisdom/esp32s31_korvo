@@ -155,3 +155,9 @@ The host suite now streams an actual FAT-backed AVI through the production
 player and a simulated 64 KiB DMA queue with 300 ms JPEG completion latency,
 slower than the 5 fps file. It checks that PCM is delivered unchanged and
 without gaps, older video jobs are bounded/dropped and the final frame arrives.
+
+After the optional Classic driver integration, the Wi-Fi/BLE build repeated
+that 165-frame replay with TCP echo and BLE notifications, with no skips, LCD
+underruns or additional I2S faults through completion. The board is restored
+to this camera recording/playback firmware. Visual/speech/A/V alignment and
+touch STOP confirmation remain pending user observation.

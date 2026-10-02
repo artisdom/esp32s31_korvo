@@ -1,0 +1,600 @@
+diff --git a/esp-radio/Cargo.toml b/esp-radio/Cargo.toml
+index 35a7b6d34..8cb9da69e 100644
+--- a/esp-radio/Cargo.toml
++++ b/esp-radio/Cargo.toml
+@@ -118,6 +118,15 @@ bt-hci-transport = { version = "0.1.0", optional = true }
+ defmt = { version = "1.1", optional = true, features = ["alloc"] }
+ log-04 = { package = "log", version = "0.4.27", optional = true }
+ 
++# Optional S31 BR/EDR discovery callbacks.
++sha2 = { version = "0.10", default-features = false, optional = true }
++hmac = { version = "0.12", default-features = false, optional = true }
++p192 = { version = "0.13", default-features = false, features = ["arithmetic"], optional = true }
++p256 = { version = "0.13", default-features = false, features = ["arithmetic"], optional = true }
++zeroize = { version = "1.8", default-features = false, optional = true }
++linked_list_allocator = { version = "0.10", default-features = false, optional = true }
++critical-section = { version = "1.2", optional = true }
++
+ [build-dependencies]
+ esp-config = { version = "0.8.0", path = "../esp-config", features = ["build"] }
+ esp-metadata-generated = { version = "0.6.0", path = "../esp-metadata-generated", features = ["build-script"] }
+@@ -307,6 +316,8 @@ sniffer = ["wifi", "__has_unstable_feature_enabled"]
+ ## Enable BLE support.
+ ##
+ ## ⚠️ This feature is considered unstable.
++# S31 controller discovery only; no pairing, ACL host or audio profiles.
++classic = ["ble", "dep:sha2", "dep:hmac", "dep:p192", "dep:p256", "dep:zeroize", "dep:linked_list_allocator", "dep:critical-section"]
+ ble = ["esp-hal/__bluetooth", "dep:bt-hci", "dep:bt-hci-transport", "dep:enumset", "__has_unstable_feature_enabled"]
+ #DOC_ENDIF
+ 
+diff --git a/esp-radio/src/ble/btdm2/classic.rs b/esp-radio/src/ble/btdm2/classic.rs
+new file mode 100644
+index 000000000..41a165c5d
+--- /dev/null
++++ b/esp-radio/src/ble/btdm2/classic.rs
+@@ -0,0 +1,235 @@
++//! Experimental S31 BR/EDR controller bring-up for inquiry only.
++//! ABI mirrored from Espressif porting_btdm/bredr.c. RustCrypto generates
++//! controller initialization keys. ECDH/pairing remains unsupported.
++use super::*;
++use hmac::{Hmac, Mac};
++use sha2::{Digest, Sha256};
++
++unsafe extern "C" {
++    fn bredr_controller_init(cfg: *mut esp_bredr_controller_config_t) -> i32;
++    fn bredr_controller_deinit();
++    fn bredr_register_setup_callback(cb: unsafe extern "C" fn() -> i32);
++    fn bredr_register_ext_dep_callback(cb: unsafe extern "C" fn() -> i32);
++    fn bredr_register_crypto_funcs(table: *const CryptoOps) -> i32;
++    fn bredr_register_bb_funcs(table: *const BbOps) -> i32;
++    fn bredr_hci_trans_register_tx(
++        acl: unsafe extern "C" fn(*mut HciDriverPacket) -> i32,
++        sync: unsafe extern "C" fn(*mut HciDriverPacket) -> i32,
++        event: unsafe extern "C" fn(*mut HciDriverPacket) -> i32,
++    );
++    fn bredr_hci_trans_evt_tx_done(pkt: *mut HciDriverPacket);
++    fn bredr_hci_trans_evt_free(pkt: *mut HciDriverPacket) -> i32;
++    fn bredr_tx_cca_fifo_empty() -> bool;
++    fn bredr_tx_cca_fifo_full() -> bool;
++    fn bredr_tx_cca_fifo_count() -> u32;
++    fn bredr_tx_cca_fifo_read() -> u32;
++    fn bredr_tx_cca_period(ru: u32, cca: u32);
++    fn bredr_tx_cca_set(
++        en: u32,
++        lo: u32,
++        drop0: u32,
++        high0: u32,
++        low0: u32,
++        enhi: u32,
++        hi: u32,
++        drop1: u32,
++        high1: u32,
++        low1: u32,
++    );
++    fn bredr_tx_cca_fifo_reset();
++    fn bredr_set_tx_on_delay(delay: u32);
++}
++
++#[repr(C)]
++struct CryptoOps {
++    p256_pair: unsafe extern "C" fn(*mut u8, *mut u8) -> i32,
++    p256_dh: unsafe extern "C" fn(*const u8, *const u8, *const u8, *mut u8) -> i32,
++    p192_pair: unsafe extern "C" fn(*mut u8, *mut u8) -> i32,
++    p192_dh: unsafe extern "C" fn(*const u8, *const u8, *const u8, *mut u8) -> i32,
++    sha: unsafe extern "C" fn(*const u8, u32, *mut u8) -> i32,
++    hmac: unsafe extern "C" fn(*const u8, u32, *const u8, u32, *mut u8) -> i32,
++}
++// RF entropy is enabled when these controller initialization callbacks run.
++#[path = "classic_crypto.rs"]
++mod crypto;
++unsafe extern "C" fn pair192(public: *mut u8, private: *mut u8) -> i32 {
++    if public.is_null() || private.is_null() {
++        return -1;
++    }
++    let public = unsafe { &mut *public.cast::<[u8; 48]>() };
++    let private = unsafe { &mut *private.cast::<[u8; 24]>() };
++    if crypto::generate192(public, private, || unsafe {
++        crate::common_adapter::random()
++    }) {
++        0
++    } else {
++        -1
++    }
++}
++unsafe extern "C" fn pair256(public: *mut u8, private: *mut u8) -> i32 {
++    if public.is_null() || private.is_null() {
++        return -1;
++    }
++    let public = unsafe { &mut *public.cast::<[u8; 64]>() };
++    let private = unsafe { &mut *private.cast::<[u8; 32]>() };
++    if crypto::generate256(public, private, || unsafe {
++        crate::common_adapter::random()
++    }) {
++        0
++    } else {
++        -1
++    }
++}
++unsafe extern "C" fn reject_dh(_: *const u8, _: *const u8, _: *const u8, _: *mut u8) -> i32 {
++    -1
++}
++unsafe extern "C" fn sha(msg: *const u8, len: u32, out: *mut u8) -> i32 {
++    if msg.is_null() || out.is_null() {
++        return -1;
++    }
++    let digest = Sha256::digest(unsafe { core::slice::from_raw_parts(msg, len as usize) });
++    unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out, 32) };
++    0
++}
++unsafe extern "C" fn hmac(
++    key: *const u8,
++    key_len: u32,
++    msg: *const u8,
++    len: u32,
++    out: *mut u8,
++) -> i32 {
++    if key.is_null() || msg.is_null() || out.is_null() {
++        return -1;
++    }
++    let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(unsafe {
++        core::slice::from_raw_parts(key, key_len as usize)
++    }) else {
++        return -1;
++    };
++    mac.update(unsafe { core::slice::from_raw_parts(msg, len as usize) });
++    let digest = mac.finalize().into_bytes();
++    unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out, 32) };
++    0
++}
++static CRYPTO: CryptoOps = CryptoOps {
++    p256_pair: pair256,
++    p256_dh: reject_dh,
++    p192_pair: pair192,
++    p192_dh: reject_dh,
++    sha,
++    hmac,
++};
++#[repr(C)]
++struct CcaParams {
++    en: u32,
++    lo: u32,
++    drop0: u32,
++    high0: u32,
++    low0: u32,
++    enhi: u32,
++    hi: u32,
++    drop1: u32,
++    high1: u32,
++    low1: u32,
++}
++#[repr(C)]
++struct BbOps {
++    empty: unsafe extern "C" fn() -> bool,
++    full: unsafe extern "C" fn() -> bool,
++    count: unsafe extern "C" fn() -> u32,
++    read: unsafe extern "C" fn() -> u32,
++    period: unsafe extern "C" fn(u32, u32),
++    set: unsafe extern "C" fn(*const CcaParams),
++    reset: unsafe extern "C" fn(),
++    delay: unsafe extern "C" fn(u32),
++}
++unsafe extern "C" fn set_cca(ptr: *const CcaParams) {
++    if let Some(p) = unsafe { ptr.as_ref() } {
++        unsafe {
++            bredr_tx_cca_set(
++                p.en, p.lo, p.drop0, p.high0, p.low0, p.enhi, p.hi, p.drop1, p.high1, p.low1,
++            )
++        }
++    }
++}
++static BB: BbOps = BbOps {
++    empty: bredr_tx_cca_fifo_empty,
++    full: bredr_tx_cca_fifo_full,
++    count: bredr_tx_cca_fifo_count,
++    read: bredr_tx_cca_fifo_read,
++    period: bredr_tx_cca_period,
++    set: set_cca,
++    reset: bredr_tx_cca_fifo_reset,
++    delay: bredr_set_tx_on_delay,
++};
++unsafe extern "C" fn setup() -> i32 {
++    0
++} // no SCO/APB/CPB/test/coexistence profiles
++unsafe extern "C" fn dependencies() -> i32 {
++    let res = unsafe { bredr_register_crypto_funcs(&CRYPTO) };
++    if res != 0 {
++        return res;
++    }
++    unsafe { bredr_register_bb_funcs(&BB) }
++}
++#[path = "classic_pool.rs"]
++mod pool;
++use pool::{pool_create, pool_free, pool_malloc};
++static POOL: orca_mempool_ops = orca_mempool_ops {
++    create_with_pool: Some(pool_create),
++    destroy: None,
++    malloc: Some(pool_malloc),
++    free: Some(pool_free),
++};
++
++pub(super) fn config() -> esp_bredr_controller_config_t {
++    let mut cfg: esp_bredr_controller_config_t = unsafe { core::mem::zeroed() };
++    // Matches the shipped 0.3.0 archive and its pre-b9ba3ea3ad8 IDF
++    // configuration layout (no additional synchronous-buffer fields).
++    cfg.bredr_version = 0x20250327;
++    cfg.bredr_magic = 0x5a5aa5a5;
++    cfg.max_acl_conn = 1;
++    cfg.max_sync_conn = 0;
++    cfg.cca_rssi_thr = -50;
++    cfg.static_aclu_tx_buf_nb = 2;
++    cfg.dynamic_aclu_tx_buf_nb = 0;
++    cfg.aclu_rx_buf_nb = 2;
++    cfg.mempool_size = 3 * 1024;
++    cfg.mempool_ops = &raw const POOL as *mut _;
++    // Zero dBm for every discovery/page/ACL transmit path; no SCO support.
++    cfg
++}
++pub(super) fn init(cfg: *mut esp_bt_controller_config_t) -> i32 {
++    unsafe {
++        // Published esp-wifi-sys S31 0.3.0 uses this ABI and does not export
++        // the later IDF bredr_ctrl_get_btdm_info query. Keep all archives from
++        // that pinned package; do not mix in a newer controller/common library.
++        bredr_register_setup_callback(setup);
++        bredr_register_ext_dep_callback(dependencies);
++        let result = bredr_controller_init(&raw mut (*cfg).bredr);
++        if result == 0 {
++            bredr_hci_trans_register_tx(reject_data, reject_data, host_rx);
++        }
++        result
++    }
++}
++unsafe extern "C" fn host_rx(pkt: *mut HciDriverPacket) -> i32 {
++    let Some(p) = (unsafe { pkt.as_ref() }) else {
++        return -1;
++    };
++    queue_rx_packet(&[p.type_], unsafe {
++        core::slice::from_raw_parts(p.data, p.length as usize)
++    });
++    unsafe {
++        bredr_hci_trans_evt_tx_done(pkt);
++        bredr_hci_trans_evt_free(pkt)
++    };
++    0
++}
++pub(super) fn deinit() {
++    unsafe { bredr_controller_deinit() }
++}
++
++unsafe extern "C" fn reject_data(_: *mut HciDriverPacket) -> i32 {
++    -1
++}
+diff --git a/esp-radio/src/ble/btdm2/classic_crypto.rs b/esp-radio/src/ble/btdm2/classic_crypto.rs
+new file mode 100644
+index 000000000..2a4d0ff94
+--- /dev/null
++++ b/esp-radio/src/ble/btdm2/classic_crypto.rs
+@@ -0,0 +1,64 @@
++//! Legacy controller initialization keys only; no pairing/ECDH host support.
++// Output matches IDF's per-coordinate little-endian BR/EDR ABI.
++pub(super) fn generate192(
++    public: &mut [u8; 48],
++    private: &mut [u8; 24],
++    mut random: impl FnMut() -> u32,
++) -> bool {
++    use p192::elliptic_curve::sec1::ToEncodedPoint;
++    let mut bytes = zeroize::Zeroizing::new([0u8; 24]);
++    for _ in 0..32 {
++        for chunk in bytes.chunks_exact_mut(4) {
++            chunk.copy_from_slice(&random().to_le_bytes());
++        }
++        let Ok(secret) = p192::elliptic_curve::SecretKey::<p192::NistP192>::from_slice(&*bytes)
++        else {
++            continue;
++        };
++        let encoded = secret.public_key().to_encoded_point(false);
++        let Some(x) = encoded.x() else {
++            return false;
++        };
++        let Some(y) = encoded.y() else {
++            return false;
++        };
++        for i in 0..24 {
++            public[i] = x[23 - i];
++            public[24 + i] = y[23 - i];
++            private[i] = bytes[23 - i];
++        }
++        return true;
++    }
++    false
++}
++
++pub(super) fn generate256(
++    public: &mut [u8; 64],
++    private: &mut [u8; 32],
++    mut random: impl FnMut() -> u32,
++) -> bool {
++    use p256::elliptic_curve::sec1::ToEncodedPoint;
++    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
++    for _ in 0..32 {
++        for chunk in bytes.chunks_exact_mut(4) {
++            chunk.copy_from_slice(&random().to_le_bytes());
++        }
++        let Ok(secret) = p256::SecretKey::from_slice(&*bytes) else {
++            continue;
++        };
++        let encoded = secret.public_key().to_encoded_point(false);
++        let Some(x) = encoded.x() else {
++            return false;
++        };
++        let Some(y) = encoded.y() else {
++            return false;
++        };
++        for i in 0..32 {
++            public[i] = x[31 - i];
++            public[32 + i] = y[31 - i];
++            private[i] = bytes[31 - i];
++        }
++        return true;
++    }
++    false
++}
+diff --git a/esp-radio/src/ble/btdm2/classic_pool.rs b/esp-radio/src/ble/btdm2/classic_pool.rs
+new file mode 100644
+index 000000000..ace997491
+--- /dev/null
++++ b/esp-radio/src/ble/btdm2/classic_pool.rs
+@@ -0,0 +1,55 @@
++//! A coalescing heap limited to the controller's reserved SRAM pool.
++use core::ffi::c_void;
++type Pool = *mut c_void;
++// Controller ownership checks require allocations inside its reserved pool.
++// Store each exact Layout in an aligned prefix so frees can coalesce/reuse it.
++static CLASSIC_POOL: critical_section::Mutex<core::cell::RefCell<linked_list_allocator::Heap>> =
++    critical_section::Mutex::new(core::cell::RefCell::new(
++        linked_list_allocator::Heap::empty(),
++    ));
++pub(super) unsafe extern "C" fn pool_create(mem: *mut c_void, bytes: usize, _: usize) -> Pool {
++    if mem.is_null() || bytes < 64 {
++        return core::ptr::null_mut();
++    }
++    critical_section::with(|cs| unsafe {
++        CLASSIC_POOL.borrow(cs).borrow_mut().init(mem.cast(), bytes);
++    });
++    mem
++}
++pub(super) unsafe extern "C" fn pool_malloc(_: Pool, size: usize) -> *mut c_void {
++    let Some(total) = size.checked_add(8) else {
++        return core::ptr::null_mut();
++    };
++    let Ok(layout) = core::alloc::Layout::from_size_align(total, 8) else {
++        return core::ptr::null_mut();
++    };
++    critical_section::with(|cs| {
++        match CLASSIC_POOL
++            .borrow(cs)
++            .borrow_mut()
++            .allocate_first_fit(layout)
++        {
++            Ok(block) => unsafe {
++                block.as_ptr().cast::<usize>().write(total);
++                block.as_ptr().add(8).cast()
++            },
++            Err(_) => core::ptr::null_mut(),
++        }
++    })
++}
++pub(super) unsafe extern "C" fn pool_free(_: Pool, ptr: *mut c_void) {
++    if ptr.is_null() {
++        return;
++    }
++    let block = unsafe { ptr.cast::<u8>().sub(8) };
++    let total = unsafe { block.cast::<usize>().read() };
++    let Ok(layout) = core::alloc::Layout::from_size_align(total, 8) else {
++        return;
++    };
++    critical_section::with(|cs| unsafe {
++        CLASSIC_POOL
++            .borrow(cs)
++            .borrow_mut()
++            .deallocate(core::ptr::NonNull::new_unchecked(block), layout);
++    });
++}
+diff --git a/esp-radio/src/ble/btdm2/mod.rs b/esp-radio/src/ble/btdm2/mod.rs
+index 0926b9e16..9a9b4c76c 100644
+--- a/esp-radio/src/ble/btdm2/mod.rs
++++ b/esp-radio/src/ble/btdm2/mod.rs
+@@ -48,6 +48,9 @@ use crate::{
+ #[cfg_attr(esp32s31, path = "os_adapter_esp32s31.rs")]
+ pub(crate) mod chip_specific;
+ 
++#[cfg(all(esp32s31, feature = "classic"))]
++mod classic;
++
+ const EXT_FUNC_VERSION: u32 = 0x20250819;
+ const EXT_FUNC_MAGIC: u32 = 0xA5A5A5A5;
+ const ACL_DATA_MBUF_LEADINGSPACE: usize = 4;
+@@ -344,6 +347,8 @@ fn bt_controller_deinit() {
+         }
+ 
+         r_ble_hci_trans_cfg_hs(None, core::ptr::null(), None, core::ptr::null());
++        #[cfg(all(esp32s31, feature = "classic"))]
++        classic::deinit();
+         ble_stack_deinit();
+         r_btdm_hci_fc_env_deinit();
+         r_btdm_task_deinit();
+@@ -404,6 +409,15 @@ fn esp_bt_controller_init(cfg: *mut esp_bt_controller_config_t) -> esp_err_t {
+             return ESP_FAIL as _;
+         }
+ 
++        #[cfg(all(esp32s31, feature = "classic"))]
++        {
++            let result = classic::init(cfg);
++            if result != 0 {
++                warn!("Classic controller init failed {}", result);
++                bt_controller_deinit();
++                return ESP_FAIL as _;
++            }
++        }
+         // IDF `hci_transport_init` registers this during init so
+         // `r_ble_hci_trans_ll_evt_tx` has a host callback before enable.
+         r_ble_hci_trans_cfg_hs(
+diff --git a/esp-radio/src/ble/btdm2/os_adapter_esp32s31.rs b/esp-radio/src/ble/btdm2/os_adapter_esp32s31.rs
+index e4c810f25..d90e3d57b 100644
+--- a/esp-radio/src/ble/btdm2/os_adapter_esp32s31.rs
++++ b/esp-radio/src/ble/btdm2/os_adapter_esp32s31.rs
+@@ -238,13 +238,26 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
+         hci_conn_num: config.max_connections,
+         sleep_en: u8::from(config.modem_sleep),
+         version_num: 0,
+-        bluetooth_mode: esp_bt_mode_t_ESP_BT_MODE_BLE as u8,
++        bluetooth_mode: if cfg!(feature = "classic") {
++            esp_bt_mode_t_ESP_BT_MODE_BTDM as u8
++        } else {
++            esp_bt_mode_t_ESP_BT_MODE_BLE as u8
++        },
+         magic: BTDM_CONFIG_MAGIC_VALUE,
+     };
+ 
+     esp_bt_controller_config_t {
+         ble,
+-        bredr: unsafe { core::mem::zeroed() },
++        bredr: {
++            #[cfg(feature = "classic")]
++            {
++                super::classic::config()
++            }
++            #[cfg(not(feature = "classic"))]
++            {
++                unsafe { core::mem::zeroed() }
++            }
++        },
+         btdm,
+     }
+ }
+diff --git a/esp-radio/tests/classic-host/Cargo.toml b/esp-radio/tests/classic-host/Cargo.toml
+new file mode 100644
+index 000000000..1ab46445e
+--- /dev/null
++++ b/esp-radio/tests/classic-host/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "s31-classic-callback-tests"
++version = "0.1.0"
++edition = "2024"
++publish = false
++[workspace]
++[dependencies]
++p192 = { version = "0.13", default-features = false, features = ["arithmetic"] }
++p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
++zeroize = { version = "1.8", default-features = false }
++linked_list_allocator = { version = "0.10", default-features = false }
++critical-section = { version = "1.2", features = ["std"] }
+diff --git a/esp-radio/tests/classic-host/src/lib.rs b/esp-radio/tests/classic-host/src/lib.rs
+new file mode 100644
+index 000000000..9ee9ffa87
+--- /dev/null
++++ b/esp-radio/tests/classic-host/src/lib.rs
+@@ -0,0 +1,103 @@
++#[path = "../../../src/ble/btdm2/classic_crypto.rs"]
++mod crypto;
++#[path = "../../../src/ble/btdm2/classic_pool.rs"]
++mod pool;
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn hex(s: &str) -> Vec<u8> {
++        (0..s.len())
++            .step_by(2)
++            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
++            .collect()
++    }
++    #[test]
++    fn scalar_one_matches_published_generators_in_controller_byte_order() {
++        let mut pub192 = [0; 48];
++        let mut priv192 = [0; 24];
++        let mut calls = 0;
++        assert!(crypto::generate192(&mut pub192, &mut priv192, || {
++            calls += 1;
++            if calls % 6 == 0 { 0x01000000 } else { 0 }
++        }));
++        let mut x = hex("188da80eb03090f67cbf20eb43a18800f4ff0afd82ff1012");
++        x.reverse();
++        let mut y = hex("07192b95ffc8da78631011ed6b24cdd573f977a11e794811");
++        y.reverse();
++        assert_eq!(&pub192[..24], x);
++        assert_eq!(&pub192[24..], y);
++        assert_eq!(priv192[0], 1);
++        assert!(priv192[1..].iter().all(|&b| b == 0));
++        let mut pub256 = [0; 64];
++        let mut priv256 = [0; 32];
++        calls = 0;
++        assert!(crypto::generate256(&mut pub256, &mut priv256, || {
++            calls += 1;
++            if calls % 8 == 0 { 0x01000000 } else { 0 }
++        }));
++        let mut x = hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
++        x.reverse();
++        let mut y = hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
++        y.reverse();
++        assert_eq!(&pub256[..32], x);
++        assert_eq!(&pub256[32..], y);
++        assert_eq!(priv256[0], 1);
++        assert!(priv256[1..].iter().all(|&b| b == 0));
++    }
++    #[test]
++    fn invalid_entropy_fails_bounded_without_exporting_a_key() {
++        let mut public = [0xa5; 48];
++        let mut private = [0xa5; 24];
++        let mut calls = 0;
++        assert!(!crypto::generate192(&mut public, &mut private, || {
++            calls += 1;
++            0
++        }));
++        assert_eq!(calls, 32 * 6);
++        assert_eq!(public, [0xa5; 48]);
++        assert_eq!(private, [0xa5; 24]);
++        let mut public = [0xa5; 64];
++        let mut private = [0xa5; 32];
++        calls = 0;
++        assert!(!crypto::generate256(&mut public, &mut private, || {
++            calls += 1;
++            u32::MAX
++        }));
++        assert_eq!(calls, 32 * 8);
++        assert_eq!(public, [0xa5; 64]);
++        assert_eq!(private, [0xa5; 32]);
++    }
++    #[test]
++    fn pool_stays_inside_reserved_memory_and_coalesces_after_repeated_packets() {
++        #[repr(align(8))]
++        struct Memory([u8; 4096]);
++        let mut mem = Memory([0; 4096]);
++        let start = mem.0.as_mut_ptr();
++        let end = unsafe { start.add(4096) };
++        let handle = unsafe { pool::pool_create(start.cast(), 4096, 4096) };
++        assert!(!handle.is_null());
++        for _ in 0..256 {
++            let mut blocks = Vec::new();
++            for size in [17, 35, 221, 61, 9, 400, 3, 127] {
++                let p = unsafe { pool::pool_malloc(handle, size) }.cast::<u8>();
++                assert!(p > start && unsafe { p.add(size) } <= end);
++                assert_eq!(p as usize % 8, 0);
++                unsafe { core::ptr::write_bytes(p, size as u8, size) };
++                blocks.push((p, size));
++            }
++            for (p, size) in blocks.into_iter().rev() {
++                assert!(
++                    unsafe { core::slice::from_raw_parts(p, size) }
++                        .iter()
++                        .all(|&b| b == size as u8)
++                );
++                unsafe { pool::pool_free(handle, p.cast()) };
++            }
++        }
++        assert!(unsafe { pool::pool_malloc(handle, usize::MAX) }.is_null());
++        assert!(unsafe { pool::pool_malloc(handle, 8192) }.is_null());
++        let p = unsafe { pool::pool_malloc(handle, 4000) };
++        assert!(!p.is_null());
++        unsafe { pool::pool_free(handle, p) };
++    }
++}

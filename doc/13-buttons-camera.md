@@ -131,8 +131,16 @@ one. The first transmission error is logged; cumulative errors appear in
 UART heartbeats.
 
 Updates run every 20 ms, with a time-based colour cycle and brightness pulse.
-Button press feedback lasts 250 ms rather than one main-loop iteration,
-so it is visible both on the LED and in the UI. The UI LED swatch uses the
+Button feedback stays orange while any debounced key is held and for one
+second after release. The initial 250 ms press-only flash was difficult
+to confirm and expired during long holds; the deadline now renews on every
+held-button poll. Feedback RGB is (64,16,0), reduced from (255,102,0) after
+the user reported that the bright output looked white. Startup shows dim
+red, green and blue for one second each and logs the configured counter
+frequency and transfer duration as a colour/timing check. Steady transfers
+measured about 339 us, consistent with the nominal 328.8 us waveform plus
+software overhead; this is not a scope measurement of individual pulses.
+The UI LED swatch uses the
 same requested RGB value. Successful RMT transfers do not by themselves
 prove the LED's physical colour output; check it on the board.
 
@@ -151,4 +159,15 @@ These are observed values on this board, not replacements for the vendor
 nominal centers used in the UI labels. Idle returned to raw 0 / 2000 mV.
 The capture reported zero RMT transmission errors and zero LCD underruns
 while keys were exercised. The user confirmed that button indicators and
-the physical LED both work, including orange feedback on presses.
+the physical LED both work. A subsequent report found the 250 ms orange
+flash difficult to confirm, so hold feedback and a one-second release tail
+were added.
+
+### Feedback visibility follow-up
+
+The user reported that the 250 ms flash was difficult to confirm and that
+full-brightness held feedback appeared white. Feedback now stays active
+through the hold and one second after release, using RGB (64,16,0).
+After flashing this change, the user confirmed correct red/green/blue
+startup colours and orange held-button feedback. RMT errors and LCD
+underruns remained zero in the serial capture.

@@ -21,7 +21,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | **works** — on-chip synthesized chime/test tone, 48 kHz/16-bit |
 | Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | `esp_hal::i2s` DMA + RMS meter | **partial** — DMA delivers samples; full-duplex clocking of the slave codec is not phase-locked in esp-hal yet, so sample quality is not guaranteed |
 | microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + hand-rolled read-only FAT inspector | **works** (verified with a 128 GB card) — card info, partition/FAT type, volume label, root dir listing, first `.TXT` preview. Never writes. |
-| WS2812 status LED | GPIO37 | `esp_hal::rmt` | **works** — colour-cycle breathing, 250 ms orange flash on key press; explicit RMT end marker and error reporting |
+| WS2812 status LED | GPIO37 | `esp_hal::rmt` | **works** — colour-cycle breathing, dim orange while a key is held and for 1 s after release; explicit RMT end marker and error reporting |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
 | USB 2.0 HS device | Type-A port, native USB_HS pins | `esp_hal::usb` (synopsys-OTG via embassy-usb) | **works** — CDC-ACM on core 1, echoes upper-cased, `?` prints a report |
 | DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: 20 MHz XCLK from LCD_CAM + paged SCCB | **detected** — PID 0xda4a; capture is future work |
@@ -41,6 +41,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 - **Touch** the tabs to switch pages (HOME / AUDIO / SD CARD / CAMERA / ABOUT).
 - **MODE** cycles pages and toggles a 440 Hz test tone.
 - **SET** replays the startup chime.
+- The LED briefly checks red, green, and blue at startup; held keys show dim orange through release plus one second.
 - **VOL+ / VOL-** change the ES8389 DAC volume in 3 dB steps.
   (Buttons require the ADC - see below.)
 

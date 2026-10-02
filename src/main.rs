@@ -136,17 +136,24 @@ async fn main(_spawner: embassy_executor::Spawner) {
     step("splash shown");
 
 
-    // --- boot blip on the WS2812 -------------------------------------------------
+    // --- boot colour check on the WS2812 -------------------------------------------------
     step("rmt");
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(10))
         .expect("RMT clock");
+    println!("WS2812: configured RMT counter {} Hz", rmt.frequency().as_hz());
     let mut led = led::StatusLed::new(
         rmt,
         peripherals.GPIO37,
     )
     .expect("LED channel");
     step("led ok");
-    led.send(0, 0, 32);
+    // Low-brightness primary colours expose an incorrectly decoded bitstream.
+    for (name, rgb) in [("red", (32, 0, 0)), ("green", (0, 32, 0)), ("blue", (0, 0, 32))] {
+        let tx_start = Instant::now();
+        led.send(rgb.0, rgb.1, rgb.2);
+        println!("WS2812: boot {} (32/255), transfer {} us", name, tx_start.elapsed().as_micros());
+        Timer::after(Duration::from_millis(1000)).await;
+    }
 
     // --- shared I2C bus (codec + touch + camera SCCB) ------------------------------
     let mut i2c = I2c::new(
@@ -330,7 +337,6 @@ async fn main(_spawner: embassy_executor::Spawner) {
 
         // ---- buttons ----
         if let Some(btn) = buttons.poll() {
-            button_flash_until_ms = start.elapsed().as_millis() + 250;
             match btn {
                 Button::Mode => {
                     st.page = st.page.next();
@@ -361,7 +367,13 @@ async fn main(_spawner: embassy_executor::Spawner) {
                 st.btn_held.map(Button::label).unwrap_or("released"), buttons.last_raw, st.btn_mv);
             previous_held = st.btn_held;
         }
-        st.flash_led = start.elapsed().as_millis() < button_flash_until_ms;
+        // Stay orange throughout a hold, then for one second after release.
+        // Renew the deadline every poll so long holds never lose feedback.
+        let now_ms = start.elapsed().as_millis();
+        if st.btn_held.is_some() {
+            button_flash_until_ms = now_ms + 1000;
+        }
+        st.flash_led = now_ms < button_flash_until_ms;
 
         // ---- touch ----
         // Touch, rendering and dirty regions all use screen coordinates.
@@ -411,7 +423,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
             let elapsed_ms = start.elapsed().as_millis();
             let led_phase = (elapsed_ms / 20) as u8;
             let (r, g, b) = if st.flash_led {
-                (0xff, 0x66, 0x00)
+                (64, 16, 0)
             } else {
                 let w = led::wheel(led_phase);
                 let t = (elapsed_ms % 4000) as u32;

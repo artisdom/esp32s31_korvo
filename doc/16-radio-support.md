@@ -340,3 +340,40 @@ and a GATT read plus five notifications passed during playback. I2S TX/RX
 fault counters remained at their startup baseline through completion. This
 Wi-Fi/BLE camera-playback build is installed on `/dev/ttyUSB0`; Classic and
 802.15.4 remain separate selectable firmware builds.
+
+## S31 radio thread migration workaround
+
+MP3 playback at 320 MHz with Wi-Fi/BLE and USB on core 1 exposed intermittent
+CPU lockups. The saved core 1 exception and immutable firmware disassembly
+show the timer worker's valid `s2` timer pointer becoming zero across a timer
+callback; its next RefCell load accesses address `0x18`. The timer queue already
+defers deletion while processing, so the fault is not explained by an immediate
+timer drop alone.
+
+The local RISC-V RTOS scheduler has a documented ordering gap: it requeues the
+running task and releases its scheduler lock before the assembly saves the
+callee-saved registers, stack pointer and program counter. An unpinned task can
+then be selected by the other CPU and resume with stale/incomplete context.
+`CompatTimer` creates such an unpinned thread. This is an evidence-based cause
+candidate for the observed zero register, not yet a proven hardware fix.
+
+External HAL commit `b083bcf94` gives otherwise-unpinned ESP32-S31 radio worker
+threads their creation CPU. Explicit CPU 0/1 affinities are preserved; other
+chips are unchanged. This avoids radio thread migration without changing the
+USB/camera main tasks. It is a narrow workaround, not a fix for generic SMP
+context-save ordering. Radio workers created on core 0 remain on core 0, so
+load/latency still need measurement.
+
+Reproduce it with `scripts/apply-radio-affinity-fix.sh [esp-hal-checkout]`.
+Both `setup-classic-s31.sh` and `apply-btdm-memory-fix.sh` apply it. The dedicated
+`patches/esp-rtos-radio-affinity-s31.patch` touches only
+`esp-rtos/src/esp_radio/mod.rs`, independently of the USB host patch. Applying
+the script twice to a fresh checkout before the fix produces the committed
+source exactly and is idempotent. Script syntax and patch whitespace checks
+pass. The S31 RTOS with radio and Embassy features also passes `cargo check`
+using the application’s local USB OTG, driver and sync patches. Sustained
+Wi-Fi/BLE + MP3 + USB hardware validation remains pending.
+
+A separate source audit found no floating-point registers or `fcsr` in the
+RISC-V RTOS `CpuContext`; this possible imafc multitasking issue has not been
+changed by the affinity workaround and needs its own evidence and tests.

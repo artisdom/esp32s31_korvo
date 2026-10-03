@@ -1,0 +1,19 @@
+diff --git a/esp-rtos/src/esp_radio/mod.rs b/esp-rtos/src/esp_radio/mod.rs
+index b83611852..8bd1b65ba 100644
+--- a/esp-rtos/src/esp_radio/mod.rs
++++ b/esp-rtos/src/esp_radio/mod.rs
+@@ -91,6 +91,14 @@ impl esp_radio_rtos_driver::SchedulerImplementation for Scheduler {
+                 None
+             }
+         });
++        // S31's RISC-V context switch saves callee-saved registers after the
++        // scheduler lock is released. Migrating a ready task at that point
++        // lets another core restore its incomplete context. Keep radio-created
++        // threads on their creation core until that SMP save ordering is fixed;
++        // explicit controller task affinities still take precedence.
++        #[cfg(esp32s31)]
++        let pin_to_core = Some(pin_to_core.unwrap_or_else(Cpu::current));
++
+         if let Some(cpu) = pin_to_core {
+             spawner = spawner.with_pinned_to(cpu);
+         }

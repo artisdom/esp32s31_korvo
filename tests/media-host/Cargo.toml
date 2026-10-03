@@ -5,7 +5,9 @@ edition = "2024"
 publish = false
 [dependencies]
 embedded-sdmmc = { path = "../../vendor/embedded-sdmmc", default-features = false }
-nanomp3-core = {version="0.2",default-features=false}
+nanomp3-core = {version="=0.2.0",default-features=false}
+nanomp3 = {version="=0.2.0",default-features=false}
+libm = "0.2"
 jpeg-encoder = { version = "0.7.1", default-features = false }
 
 zune-jpeg = { version = "0.5.15", default-features = false }

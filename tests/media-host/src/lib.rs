@@ -8,10 +8,19 @@ macro_rules! println { ($($arg:tt)*) => { std::println!($($arg)*) }; }
 mod video_player;
 #[cfg(test)]
 mod storage {
-    pub type Name = heapless::String<13>;
+    pub type Name = crate::fat_files::Name;
     pub struct Storage {
         pub fs: embedded_sdmmc::VolumeManager<crate::integration::Disk, crate::integration::Clock>,
         pub root: embedded_sdmmc::RawDirectory,
+    }
+    impl Storage {
+        pub fn open(
+            &self,
+            path: &str,
+            mode: embedded_sdmmc::Mode,
+        ) -> Result<embedded_sdmmc::RawFile, &'static str> {
+            crate::fat_files::open(&self.fs, self.root, path, mode)
+        }
     }
 }
 #[cfg(test)]
@@ -55,20 +64,28 @@ mod audio {
         }
     }
 }
+#[path = "../../../src/audio_queue.rs"]
+mod audio_queue;
 #[path = "../../../src/avi.rs"]
 mod avi;
 #[path = "../../../src/avi_playback.rs"]
 mod avi_playback;
 #[path = "../../../src/delete_request.rs"]
 mod delete_request;
+#[path = "../../../src/fat_files.rs"]
+mod fat_files;
 #[path = "../../../src/fat_layout.rs"]
 mod fat_layout;
 #[path = "../../../src/jpeg_decoder.rs"]
 mod jpeg_decoder;
 #[path = "../../../src/jpeg_worker.rs"]
 mod jpeg_worker;
+#[path = "../../../src/mp3.rs"]
+mod mp3;
 #[path = "../../../src/pcm.rs"]
 mod pcm;
+#[path = "../../../src/pcm_worker.rs"]
+mod pcm_worker;
 #[path = "../../../src/psram_buffer.rs"]
 mod psram_buffer;
 #[cfg(test)]
@@ -520,6 +537,188 @@ mod integration {
         std::fs::remove_file(path).unwrap();
     }
     #[test]
+    fn recursive_catalog_exceeds_64_tracks_and_pins_nested_delete() {
+        let path = std::env::temp_dir().join(format!("korvo-library-{}.img", std::process::id()));
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(64 * 1024 * 1024).unwrap();
+        assert!(
+            Command::new("mkfs.fat")
+                .args(["-F", "32"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut boot = [0u8; 512];
+        f.read_exact(&mut boot).unwrap();
+        let layout = fat_layout::Layout::detect(&boot, 64 * 1024 * 1024 / 512);
+        let fs = VolumeManager::new(
+            Disk {
+                file: RefCell::new(f),
+                layout,
+            },
+            Clock,
+        );
+        let vol = fs.open_raw_volume(VolumeIdx(0)).unwrap();
+        let root = fs.open_root_dir(vol).unwrap();
+        for i in 0..70 {
+            let name = format!("SONG{i:04}.MP3");
+            let file = fs
+                .open_file_in_dir(root, name.as_str(), Mode::ReadWriteCreate)
+                .unwrap();
+            fs.write(file, &[i as u8]).unwrap();
+            fs.close_file(file).unwrap();
+        }
+        let mut current = root;
+        let mut deepest = String::new();
+        for depth in 0..8 {
+            let name = format!("LEVEL{depth}");
+            fs.make_dir_in_dir(current, name.as_str()).unwrap();
+            let child = fs.open_dir(current, name.as_str()).unwrap();
+            if current != root {
+                fs.close_dir(current).unwrap();
+            }
+            current = child;
+            deepest.push_str(&name);
+            deepest.push('/');
+        }
+        fs.close_dir(current).unwrap();
+        deepest.push_str("SONG0000.MP3");
+        let nested = crate::fat_files::open(&fs, root, &deepest, Mode::ReadWriteCreate).unwrap();
+        fs.write(nested, b"nested payload").unwrap();
+        fs.close_file(nested).unwrap();
+        let catalog = crate::fat_files::catalog(&fs, root).unwrap();
+        assert_eq!(catalog.len(), 71);
+        assert!(catalog.contains(&deepest));
+        let open = crate::fat_files::open(&fs, root, &deepest, Mode::ReadOnly).unwrap();
+        assert!(crate::fat_files::delete(&fs, root, &deepest).is_err());
+        let mut payload = [0; 14];
+        assert_eq!(fs.read(open, &mut payload).unwrap(), 14);
+        assert_eq!(&payload, b"nested payload");
+        fs.close_file(open).unwrap();
+        crate::fat_files::delete(&fs, root, &deepest).unwrap();
+        assert_eq!(crate::fat_files::catalog(&fs, root).unwrap().len(), 70);
+        let sibling = crate::fat_files::open(&fs, root, "SONG0000.MP3", Mode::ReadOnly).unwrap();
+        assert_eq!(fs.file_length(sibling).unwrap(), 1);
+        fs.close_file(sibling).unwrap();
+        assert!(
+            crate::fat_files::open(&fs, root, "LEVEL0/../SONG0000.MP3", Mode::ReadOnly).is_err()
+        );
+        // Failed paths must not leak handles into later traversals.
+        for _ in 0..10 {
+            assert!(
+                crate::fat_files::open(&fs, root, "LEVEL0/MISSING/X.MP3", Mode::ReadOnly).is_err()
+            );
+        }
+        assert_eq!(crate::fat_files::catalog(&fs, root).unwrap().len(), 70);
+        fs.close_dir(root).unwrap();
+        fs.close_volume(vol).unwrap();
+        drop(fs);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn gpt_fat32_mount_record_and_crc_rejection_preserve_partition_tables() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("korvo-gpt-{}.img", std::process::id()));
+        let part = path.with_extension("fat");
+        let mut disk = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        disk.set_len(66 * 1024 * 1024).unwrap();
+        assert!(
+            Command::new("sgdisk")
+                .args(["-og", "--new=1:2048:133119", "--typecode=1:0700"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let volume = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .unwrap();
+        volume.set_len(64 * 1024 * 1024).unwrap();
+        assert!(
+            Command::new("mkfs.fat")
+                .args(["-F", "32"])
+                .arg(&part)
+                .status()
+                .unwrap()
+                .success()
+        );
+        disk.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        std::io::copy(&mut File::open(&part).unwrap(), &mut disk).unwrap();
+        disk.seek(SeekFrom::Start(0)).unwrap();
+        let mut metadata = vec![0; 34 * 512];
+        disk.read_exact(&mut metadata).unwrap();
+        let layout = fat_layout::Layout::read(66 * 2048, |index, bytes| {
+            disk.seek(SeekFrom::Start(index as u64 * 512)).unwrap();
+            disk.read_exact(bytes).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            (layout.offset, layout.blocks, layout.overlay, layout.fat32),
+            (2048, 131072, true, true)
+        );
+        assert_eq!(layout.physical(0), None);
+        assert_eq!(layout.physical(1), Some(2048));
+        assert_eq!(layout.physical(131072), Some(133119));
+        assert_eq!(layout.physical(131073), None);
+        let fs = VolumeManager::new(
+            Disk {
+                file: RefCell::new(disk),
+                layout,
+            },
+            Clock,
+        );
+        let vol = fs.open_raw_volume(VolumeIdx(0)).unwrap();
+        let root = fs.open_root_dir(vol).unwrap();
+        let file = fs
+            .open_file_in_dir(root, "REC00001.WAV", Mode::ReadWriteCreate)
+            .unwrap();
+        fs.write(file, &pcm::wav_header(4096)).unwrap();
+        fs.write(file, &[0; 4096]).unwrap();
+        fs.close_file(file).unwrap();
+        let file = fs
+            .open_file_in_dir(root, "REC00001.WAV", Mode::ReadOnly)
+            .unwrap();
+        assert_eq!(fs.file_length(file).unwrap(), 4140);
+        fs.close_file(file).unwrap();
+        fs.close_dir(root).unwrap();
+        fs.close_volume(vol).unwrap();
+        drop(fs);
+        let mut disk = File::open(&path).unwrap();
+        let mut after = vec![0; metadata.len()];
+        disk.read_exact(&mut after).unwrap();
+        assert_eq!(metadata, after, "GPT or protective MBR was modified");
+        // Independently generated GPT checksums must fail if header/table data changes.
+        for corrupt in [512 + 40, 1024] {
+            let mut damaged = metadata.clone();
+            damaged[corrupt] ^= 1;
+            assert!(
+                fat_layout::Layout::read(66 * 2048, |index, bytes| {
+                    let start = index as usize * 512;
+                    bytes.copy_from_slice(&damaged[start..start + 512]);
+                    Ok(())
+                })
+                .is_err()
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(part).unwrap();
+    }
+    #[test]
     fn mp3_fixture_decodes_and_resamples_to_48khz_stereo() {
         let mut data = include_bytes!("../../fixtures/demo.mp3").as_slice();
         let mut d = nanomp3_core::Decoder::new();
@@ -545,6 +744,8 @@ mod integration {
         }
         assert!(frames >= 44100 * 2);
         assert!(nonzero > 44100);
+        let mut tail = [0u8; 744];
+        bytes += r.finish(&mut tail);
         assert_eq!(bytes / 4, (frames as u64 * 48000 / 44100) as usize);
     }
 }
@@ -724,9 +925,12 @@ fn lcd_paint_preserves_queued_and_ready_decode_jobs() {
 }
 
 #[cfg(test)]
-#[path="../../../src/usb_input.rs"]
+#[path = "../../../src/usb_input.rs"]
 mod usb_input;
 
 #[cfg(test)]
-#[path="../../../src/usb_hid.rs"]
+#[path = "../../../src/usb_hid.rs"]
 mod usb_hid;
+
+#[cfg(test)]
+mod mp3_tests;

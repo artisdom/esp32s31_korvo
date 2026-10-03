@@ -411,5 +411,8 @@ interval, so caller-saved FP registers cannot be legitimately overwritten by a
 Rust call. Two CPU-0-pinned tasks perform 6,600 comparisons. Immutable pre-fix
 and fixed firmware are `target/lcd-debug/korvo-fpu-all-baseline.elf` and
 `target/lcd-debug/korvo-fpu-all-fixed.elf`; the fixed expected UART result is
-`FPU RESULT: checks=6600 failures=0 PASS`. Expanded hardware confirmation and
-combined media/radio endurance validation remain pending.
+`FPU RESULT: checks=6600 failures=0 PASS`. Hardware captured 6,511 failures
+out of 6,600 comparisons before the fix, and zero failures with the fix.
+The logs are `target/lcd-debug/fpu-all-baseline-validation.log` and
+`target/lcd-debug/fpu-all-fixed-validation.log`. Combined media/radio endurance
+validation is recorded with the MP3 work in [SD audio](14-sd-audio-recording.md).

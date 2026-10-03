@@ -290,7 +290,13 @@ impl Audio {
             };
             let mut chunk = [0u8; TX_CHUNK];
             sample_gen.fill(&mut chunk);
-            self.tx_transfer.push(&chunk);
+            if self.source == Source::Silence {
+                // Returning to idle after EOF intentionally leaves no queued
+                // PCM; reserving silence is not a playback underrun.
+                self.tx_transfer.push_silence(&chunk);
+            } else {
+                self.tx_transfer.push(&chunk);
+            }
             self.phase = sample_gen.phase;
             self.chime_left = sample_gen.chime_left;
             if self.source == Source::Chime && self.chime_left == 0 {

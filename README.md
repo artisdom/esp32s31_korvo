@@ -20,13 +20,13 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | Capacitive touch | GT1151 @ I2C 0x14 | this repo (`touch.rs`, 16-bit regs, checksummed reports) | **works** — polled, drives page navigation + cursor |
 | Audio playback | ES8389 codec @ I2C **0x10** + 2x NS4150B 3 W PAs | this repo (`es8389.rs`, full vendor init sequence ported) + `esp_hal::i2s` DMA streaming | SD MP3 and PCM WAV playback implemented; DMA completion verified on this board, audible chime confirmed |
 | Mic capture | 2 analog mics -> ES8389 ADC -> I2S0 RX | shared-clock I2S rings + RMS meter + FAT WAV recorder | 48 kHz stereo WAV recording; clean new recording playback confirmed by user |
-| microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + `embedded-sdmmc` | **works** on the 128 GB FAT32 card: file playback, new numbered WAV recordings, and read-only boot inspection |
+| microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + `embedded-sdmmc` | **works** on 128 GB superfloppy FAT32 and 32 GB GPT/FAT32 cards: recursive file access, playback and new recordings |
 | WS2812 status LED | GPIO37 | `esp_hal::rmt` | **disabled at user request** — black latched once at startup; no animation or button feedback |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
 | USB hub / keyboard / mouse | Type-A, native USB_HS PHY | Rust Embassy USB host, FS/LS bus | hub/child enumeration and packed mouse reports verified; final input confirmation pending — USB page, typing, cursor/clicks, hub hotplug; see [USB host](doc/17-usb-host-input.md) |
 | DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: paged SCCB + DVP RX, Rust JPEG and AVI | live 320x240 preview and MJPEG + stereo microphone AVI recording; on-board AVI playback; SD file also decoded on host |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
-| Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: JPEG + USB tasks |
+| Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: MP3 rate conversion, JPEG + USB tasks |
 | Wi-Fi 6 / BLE / Classic / 802.15.4 | modem | `esp-radio` | **optional builds** — station/DHCP/TCP echo, BLE uptime GATT, Classic inquiry, 802.15.4/Zigbee discovery and experimental commissioning; [status and limits](doc/16-radio-support.md) |
 
 ## Console
@@ -48,8 +48,8 @@ USB keyboard and mouse shortcuts are described in [USB host input](doc/17-usb-ho
 - **VOL+ / VOL-** change the ES8389 DAC volume in 3 dB steps.
   (Buttons require the ADC - see below.)
 
-Put MP3 or integer PCM WAV files in the FAT16/FAT32 card root before boot.
-The browser shows up to 64 files using their FAT 8.3 names/aliases. Recordings
+Put MP3 or integer PCM WAV files anywhere on the FAT16/FAT32 card before boot.
+The browser scans folders using FAT 8.3 aliases, without the former 64-file cap. Recordings
 use new `REC00001.WAV`, `REC00002.WAV`, etc. files; existing files are preserved.
 Tap STOP to save before power-off or card removal. See [SD audio and recording](doc/14-sd-audio-recording.md) for formats, console commands, and validation.
 
@@ -144,7 +144,7 @@ rustup target add riscv32imafc-unknown-none-elf
 
 # The esp-rs crates point at a local checkout of esp-hal @ 0e9fe8d with the
 # branch `s31-adc-clock-patch` checked out (see Cargo.toml path deps).
-scripts/setup-usb-host.sh    # pinned Embassy host + HAL compatibility patches
+scripts/setup-usb-host.sh    # USB host and S31 RTOS compatibility patches
 cargo run --release          # builds USB host + media, flashes and opens monitor
 ```
 
@@ -159,10 +159,9 @@ point at a fixed local checkout of that revision.
 
 ## Current limitations
 
-- Root-directory browser, up to 64 MP3/WAV files; long names appear as FAT 8.3 aliases.
-- FAT16/FAT32 only for media; exFAT is detected by boot inspection but cannot play or record.
-- WAV: integer PCM, 8/16/24/32-bit, mono/stereo, 8–96 kHz. MP3: MPEG Layer III. AAC, Ogg, FLAC and float/extensible WAV are unsupported.
-- Playback converts to 48 kHz stereo with nearest-neighbour rate conversion. Gapless MP3 playback and higher-quality resampling are future improvements.
+- Recursive media browser; long file/folder names appear as FAT 8.3 aliases. Catalog size is limited by available memory.
+- FAT16/FAT32 media on superfloppy, MBR or CRC-validated GPT cards; exFAT cannot play or record.
+- WAV: integer PCM, 8/16/24/32-bit, mono/stereo, 8–96 kHz. MP3: MPEG-1/2/2.5 Layer III, all nine rates, mono/stereo, CBR/VBR and free-format. AAC, Ogg, FLAC and float/extensible WAV are unsupported.
+- Playback uses filtered 64-tap sinc conversion to 48 kHz stereo; native 48 kHz is bit exact. Xing/LAME encoder delay/padding is trimmed when supplied. There is no automatic playlist or cross-track gapless scheduling.
 - Recording uses 48 kHz stereo PCM16 WAV (~11.5 MB/minute). Save with STOP; there is no power-loss recovery or hot removal support.
 - FAT timestamps use a fixed date (2026-10-02); there is no real-time clock synchronisation.
-- Camera: probe only (see above). Radio: not attempted.

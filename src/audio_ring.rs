@@ -112,12 +112,7 @@ impl<const RX: bool> Ring<RX> {
             }
             done.saturating_sub(self.cursor) as usize
         } else {
-            // An underrun supplies zeros, rather than replaying the old ring.
-            if self.cursor < done + CHUNK as u64 {
-                self.lost += 1;
-                self.cursor = done + (CHUNK * 2) as u64;
-            }
-            (done + (LEN - CHUNK) as u64).saturating_sub(self.cursor) as usize
+            crate::audio_queue::available(self.cursor, done, LEN, CHUNK)
         }
     }
     pub fn queued(&self) -> usize {
@@ -140,6 +135,23 @@ impl<const RX: bool> Ring<RX> {
         }
     }
     pub fn push(&mut self, bytes: &[u8]) -> usize {
+        self.push_pcm(bytes, true)
+    }
+    pub fn push_silence(&mut self, bytes: &[u8]) -> usize {
+        self.push_pcm(bytes, false)
+    }
+    fn push_pcm(&mut self, bytes: &[u8], report_loss: bool) -> usize {
+        if !RX && bytes.len() >= 4 {
+            // Recover only when appending PCM, so EOF queries do not keep
+            // advancing the tail. Played blocks have already been zeroed.
+            let cursor = crate::audio_queue::write_cursor(self.cursor, Self::done(), CHUNK);
+            if cursor != self.cursor {
+                if report_loss {
+                    self.lost += 1;
+                }
+                self.cursor = cursor;
+            }
+        }
         let mut n = bytes.len().min(self.available());
         n -= n % 4;
         let mut offset = 0;

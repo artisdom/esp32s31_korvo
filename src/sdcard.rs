@@ -129,30 +129,21 @@ async fn inspect_filesystem(
 ) -> Result<(), &'static str> {
     let mut block0: Aligned<aligned::A4, [u8; BLOCK]> = aligned::Aligned([0u8; BLOCK]);
     read(dev, 0, &mut block0).await?;
-    let b: &[u8] = &block0[..];
-
-    let mut fat_lba: u32 = 0;
-    if b[510] == 0x55 && b[511] == 0xAA && b[0] != 0xEB && b[0] != 0xE9 {
-        // MBR with partition table
-        for i in 0..4 {
-            let p = &b[446 + i * 16..446 + i * 16 + 16];
-            let ptype = p[4];
-            if ptype == 0 || ptype == 0xEE {
-                continue;
-            }
-            fat_lba = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
-            report.partition = match ptype {
-                0x01 | 0x04 | 0x06 => "FAT12/16",
-                0x0B | 0x0C => "FAT32",
-                0x07 => "exFAT/NTFS",
-                _ => "other",
-            };
-            break;
-        }
+    let layout =
+        crate::fat_layout::Layout::read(dev.card().csd.block_count() as u32, |index, bytes| {
+            let mut aligned = Aligned::<aligned::A4, _>([0u8; BLOCK]);
+            embassy_futures::block_on(read(dev, index, &mut aligned))?;
+            bytes.copy_from_slice(&aligned[..]);
+            Ok(())
+        })?;
+    let fat_lba = layout.offset;
+    report.partition = if block0[446..510].chunks_exact(16).any(|p| p[4] == 0xee) {
+        "GPT FAT"
+    } else if layout.offset != 0 {
+        "MBR FAT"
     } else {
-        // Superfloppy: filesystem starts at block 0.
-        report.partition = "superfloppy";
-    }
+        "superfloppy"
+    };
 
     let mut bs: Aligned<aligned::A4, [u8; BLOCK]> = aligned::Aligned([0u8; BLOCK]);
     read(dev, fat_lba, &mut bs).await?;

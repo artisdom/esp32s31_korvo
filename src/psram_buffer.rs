@@ -1,6 +1,26 @@
 //! Large application buffers explicitly use PSRAM, preserving internal RAM for DMA/radio.
 extern crate alloc;
 use alloc::{alloc::Layout, boxed::Box};
+/// Prepared filter phases live outside the scarce internal DMA heap.
+pub fn floats(len: usize) -> Box<[f32]> {
+    if len == 0 {
+        return Box::default();
+    }
+    let layout = Layout::array::<f32>(len).expect("float buffer layout");
+    #[cfg(target_arch = "riscv32")]
+    let ptr =
+        unsafe { esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout) };
+    #[cfg(not(target_arch = "riscv32"))]
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    if ptr.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        let ptr = ptr.cast::<f32>();
+        ptr.write_bytes(0, len);
+        Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
+    }
+}
 pub fn zeroed(len: usize) -> Box<[u8]> {
     if len == 0 {
         return Box::default();
@@ -49,4 +69,8 @@ pub fn boxed<T>(value: T) -> Box<T> {
         ptr.write(value);
         Box::from_raw(ptr)
     }
+}
+#[cfg(not(target_arch = "riscv32"))]
+pub fn samples(len: usize) -> Box<[i16]> {
+    alloc::vec![0; len].into_boxed_slice()
 }

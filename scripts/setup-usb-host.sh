@@ -20,5 +20,7 @@ apply_once() {
 git -C "$embassy_checkout" merge-base --is-ancestor "$revision" HEAD
 apply_once "$embassy_checkout" "$repo_root/patches/embassy-usb-host-s31.patch"
 apply_once "$hal_checkout" "$repo_root/patches/esp-hal-usb-host-s31.patch"
-printf '%s\n' 'USB patches applied. Commit them in the dependency checkouts.'
+"$repo_root/scripts/apply-radio-affinity-fix.sh" "$hal_checkout"
+"$repo_root/scripts/apply-fpu-context-fix.sh" "$hal_checkout"
+printf '%s\n' 'USB and S31 RTOS patches applied. Commit them in the dependency checkouts.'
 printf '%s\n' 'Cargo.toml paths must match the selected checkout locations.'

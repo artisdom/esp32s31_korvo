@@ -40,9 +40,9 @@ impl Player {
         decoder: &'static crate::jpeg_decoder::Worker,
         generation: u32,
     ) -> Result<Self, &'static str> {
-        let file =
-            s.fs.open_file_in_dir(s.root, name.as_str(), Mode::ReadOnly)
-                .map_err(|_| "AVI open failed")?;
+        let file = s
+            .open(name.as_str(), Mode::ReadOnly)
+            .map_err(|_| "AVI open failed")?;
         let parsed = (|| {
             let mut header = [0u8; avi::HEADER_BYTES];
             if s.fs

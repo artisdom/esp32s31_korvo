@@ -28,6 +28,7 @@ use static_cell::StaticCell;
 
 mod app_allocator;
 mod audio;
+mod audio_queue;
 mod audio_ring;
 mod avi;
 mod avi_playback;
@@ -40,6 +41,7 @@ mod core_memory;
 mod delete_request;
 mod display;
 mod es8389;
+mod fat_files;
 mod fat_layout;
 mod font;
 mod gfx;
@@ -47,7 +49,9 @@ mod jpeg_decoder;
 mod jpeg_worker;
 mod led;
 mod media;
+mod mp3;
 mod pcm;
+mod pcm_worker;
 mod psram_buffer;
 #[cfg(any(
     feature = "radio-wifi-ble",
@@ -89,7 +93,10 @@ fn step(msg: &str) {
 
 #[esp_hal::main]
 async fn main(_spawner: embassy_executor::Spawner) {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    // Layer III decoding plus stereo sinc conversion must keep ahead of I2S.
+    // The default CPU clock cannot sustain the higher-quality filter.
+    let peripherals =
+        esp_hal::init(esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::max()));
 
     step("== ESP32-S31-Korvo-1 Rust demo ==");
     println!("chip: {}", esp_hal::chip!());
@@ -344,7 +351,9 @@ async fn main(_spawner: embassy_executor::Spawner) {
     let encoder = &*JPEG_WORKER.init(jpeg_worker::Worker::new());
     static JPEG_DECODER: StaticCell<jpeg_decoder::Worker> = StaticCell::new();
     let decoder = &*JPEG_DECODER.init(jpeg_decoder::Worker::new());
-    let mut media = media::Media::new(storage, encoder, decoder);
+    static PCM_WORKER: StaticCell<pcm_worker::Worker> = StaticCell::new();
+    let pcm_worker = &*PCM_WORKER.init(pcm_worker::Worker::new());
+    let mut media = media::Media::new(storage, encoder, decoder, pcm_worker);
 
     // --- buttons -------------------------------------------------------------------------------
     let mut buttons = buttons::Buttons::new(peripherals.ADC1, peripherals.GPIO42);
@@ -362,6 +371,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
         executor.run(|spawner| {
             spawner.spawn(usb::usb_task(usb_hs).expect("spawn usb"));
             spawner.spawn(jpeg_task(encoder, decoder).expect("spawn JPEG"));
+            spawner.spawn(pcm_task(pcm_worker).expect("spawn PCM filter"));
         });
     });
     step("core1 usb task");
@@ -386,10 +396,10 @@ async fn main(_spawner: embassy_executor::Spawner) {
         mic_level: 0.0,
         volume_db: -30.0,
         audio_source: audio.source(),
-        media_name: heapless::String::new(),
+        media_name: storage::Name::new(),
         media_status: heapless::String::new(),
         media_count: 0,
-        sd_file_name: heapless::String::new(),
+        sd_file_name: storage::Name::new(),
         sd_file_count: 0,
         sd_file_index: 0,
         delete_name: None,
@@ -397,10 +407,10 @@ async fn main(_spawner: embassy_executor::Spawner) {
         recording: false,
         video_recording: false,
         video_playing: false,
-        video_selected: heapless::String::new(),
+        video_selected: storage::Name::new(),
         video_count: 0,
         video_index: 0,
-        video_name: heapless::String::new(),
+        video_name: storage::Name::new(),
         video_frames: 0,
         camera_frames: 0,
         camera_errors: 0,
@@ -627,28 +637,32 @@ async fn main(_spawner: embassy_executor::Spawner) {
             media.video_frame(&camera.frame, camera_new_frame);
         }
         media.poll(&mut audio);
+        if media.audio_playing() {
+            // Feed two bounded decode/read blocks between UI polls. A full
+            // ring makes the second call cheap; video still advances once.
+            media.poll(&mut audio);
+        }
         st.media_name.clear();
-        let _ = st.media_name.push_str("Selected: ");
-        let _ = st.media_name.push_str(media.selected_name());
+        st.media_name.push_str(media.selected_name());
         st.media_status = media.status.clone();
         st.media_count = media.tracks.len();
-        st.sd_file_name = media
-            .files
-            .get(media.file_selected)
-            .cloned()
-            .unwrap_or_default();
+        st.sd_file_name.clear();
+        if let Some(name) = media.files.get(media.file_selected) {
+            st.sd_file_name.push_str(name);
+        }
         st.sd_file_count = media.files.len();
         st.sd_file_index = media.file_selected;
-        st.delete_name = media.delete_request.name().cloned();
+        st.delete_name
+            .clone_from(&media.delete_request.name().cloned());
         st.media_seconds = media.seconds;
         st.recording = media.recording();
         st.video_recording = media.video_recording();
         st.video_playing = media.video_playing();
         st.video_selected.clear();
-        let _ = st.video_selected.push_str(media.selected_video());
+        st.video_selected.push_str(media.selected_video());
         st.video_count = media.videos.len();
         st.video_index = media.video_selected;
-        st.video_name = media.video_name.clone();
+        st.video_name.clone_from(&media.video_name);
         st.video_frames = media.video_frames;
         st.camera_frames = camera_stream.as_ref().map(|c| c.count).unwrap_or(0);
         st.camera_errors = camera_stream.as_ref().map(|c| c.errors).unwrap_or(0);
@@ -667,43 +681,59 @@ async fn main(_spawner: embassy_executor::Spawner) {
         // Full redraw only when the page changes; otherwise repaint just
         // the dynamic widgets and cache-clean those regions (a full-frame
         // clean every tick starves the LCD DMA and the panel rolls).
-        if decoder.paint(|| {
-            let cursor = ui::cursor(&mut display.canvas(), None);
-            display.flush_rects(cursor.as_slice());
-            if shown_page != st.page {
-                shown_page = st.page;
-                ui::draw(&mut display.canvas(), &st);
-                display.flush();
-            } else if dyn_tick.elapsed().as_millis() >= 50 {
-                dyn_tick = Instant::now();
-                let dirty = ui::draw_dynamic(&mut display.canvas(), &st);
-                display.flush_rects(&dirty.as_slice());
-            }
+        if pcm_worker
+            .paint(|| {
+                decoder.paint(|| {
+                    let cursor = ui::cursor(&mut display.canvas(), None);
+                    display.flush_rects(cursor.as_slice());
+                    if shown_page != st.page {
+                        shown_page = st.page;
+                        ui::draw(&mut display.canvas(), &st);
+                        display.flush();
+                    } else if dyn_tick.elapsed().as_millis()
+                        >= if media.audio_playing() { 250 } else { 50 }
+                    {
+                        dyn_tick = Instant::now();
+                        let dirty = ui::draw_dynamic(&mut display.canvas(), &st);
+                        display.flush_rects(&dirty.as_slice());
+                    }
 
-            if st.page == Page::Camera
-                && media.video_playing()
-                && (media.playback_changed() || repaint_page)
-            {
-                if let Some(image) = media.playback_frame() {
-                    ui::draw_playback_frame(&mut display.canvas(), image);
-                    display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
-                }
-            }
-            if st.page == Page::Camera && !media.video_playing() && camera_new_frame {
-                if let Some(camera) = camera_stream.as_ref() {
-                    ui::draw_camera_frame(&mut display.canvas(), &camera.frame);
-                    display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
-                }
-            }
-            let cursor = ui::cursor(&mut display.canvas(), st.touch_point);
-            display.flush_rects(cursor.as_slice());
-        }) {
+                    if st.page == Page::Camera
+                        && media.video_playing()
+                        && (media.playback_changed() || repaint_page)
+                    {
+                        if let Some(image) = media.playback_frame() {
+                            ui::draw_playback_frame(&mut display.canvas(), image);
+                            display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
+                        }
+                    }
+                    if st.page == Page::Camera && !media.video_playing() && camera_new_frame {
+                        if let Some(camera) = camera_stream.as_ref() {
+                            ui::draw_camera_frame(&mut display.canvas(), &camera.frame);
+                            display.flush_rects(&[gfx::Rect::new(20, 120, 320, 240)]);
+                        }
+                    }
+                    let cursor = ui::cursor(&mut display.canvas(), st.touch_point);
+                    display.flush_rects(cursor.as_slice());
+                })
+            })
+            .unwrap_or(false)
+        {
             media.frame_presented();
         }
         st.led_rgb = (0, 0, 0); // LED intentionally disabled.
 
         // periodic heartbeat (time-based: `frame` resets every second)
         if st.uptime_s != 0 && st.uptime_s % 10 == 0 && frame == 1 {
+            println!(
+                "CPU: {} MHz divider={}",
+                esp_hal::clock::cpu_clock().as_mhz(),
+                esp_hal::peripherals::HP_SYS_CLKRST::regs()
+                    .cpu_freq_ctrl0()
+                    .read()
+                    .cpu_clk_div_num()
+                    .bits()
+            );
             println!(
                 "loop ok: {} fps, mic {:3.0}% [{}/{}], btn {} mV (raw {}), heap {} kB",
                 fps,
@@ -761,5 +791,13 @@ async fn jpeg_task(worker: &'static jpeg_worker::Worker, decoder: &'static jpeg_
         decoder.paint(|| worker.encode());
         decoder.run();
         embassy_time::Timer::after_millis(2).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn pcm_task(worker: &'static pcm_worker::Worker) {
+    loop {
+        worker.run();
+        embassy_time::Timer::after_millis(1).await;
     }
 }

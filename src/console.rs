@@ -1,7 +1,7 @@
 //! Line commands on the existing UART0 debug console. TX stays with esp-println.
 use crate::media::Command;
 pub struct Console {
-    line: heapless::String<64>,
+    line: heapless::String<256>,
 }
 impl Console {
     pub fn new() -> Self {
@@ -61,6 +61,10 @@ impl Console {
                     "cancel-delete" => Some(Command::CancelDelete),
                     "file-next" => Some(Command::FileNext),
                     "file-prev" => Some(Command::FilePrevious),
+                    text if text.starts_with("play ") => {
+                        let name = text[5..].trim().to_ascii_uppercase();
+                        Some(Command::PlayNamed(name))
+                    }
                     _ => None,
                 };
                 esp_println::println!("console: {}", self.line);

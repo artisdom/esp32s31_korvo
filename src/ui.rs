@@ -57,7 +57,7 @@ pub struct AppStatus {
     pub mic_level: f32,
     pub volume_db: f32,
     pub audio_source: audio::Source,
-    pub media_name: heapless::String<64>,
+    pub media_name: crate::storage::Name,
     pub media_status: heapless::String<64>,
     pub media_seconds: u32,
     pub media_count: usize,
@@ -68,7 +68,7 @@ pub struct AppStatus {
     pub recording: bool,
     pub video_recording: bool,
     pub video_playing: bool,
-    pub video_selected: heapless::String<32>,
+    pub video_selected: crate::storage::Name,
     pub video_count: usize,
     pub video_index: usize,
     pub video_name: crate::storage::Name,
@@ -714,11 +714,28 @@ pub fn hit_media(page: Page, x: u16, y: u16, confirming: bool) -> Option<crate::
     }
     None
 }
+fn path_suffix(path: &str, columns: usize) -> &str {
+    let start = path
+        .char_indices()
+        .rev()
+        .nth(columns.saturating_sub(1))
+        .map_or(0, |(n, _)| n);
+    &path[start..]
+}
 fn delete_controls(c: &mut Canvas, st: &AppStatus, y: usize, d: &mut Dirty) {
     c.rect(548, y, 232, 108, gfx::PANEL);
     if let Some(name) = &st.delete_name {
         c.text(558, y + 6, "Permanently delete?", gfx::WARN, 1);
-        c.text(558, y + 28, name, gfx::TEXT, 1);
+        c.text(
+            558,
+            y + 24,
+            name.rsplit('/').next().unwrap_or(name),
+            gfx::TEXT,
+            1,
+        );
+        if let Some((folder, _)) = name.rsplit_once('/') {
+            c.text(558, y + 40, path_suffix(folder, 27), gfx::MUTED, 1);
+        }
         for (x, label) in [(548, "CONFIRM"), (664, "CANCEL")] {
             c.rect(x, y + 60, 112, 48, gfx::PANEL_HI);
             c.text(x + 10, y + 78, label, gfx::WARN, 1);
@@ -763,7 +780,7 @@ fn page_audio_static(c: &mut Canvas, st: &AppStatus) {
     c.text(
         20,
         124,
-        "SD root: MP3 + integer PCM WAV (mono / stereo)",
+        "SD folders: MP3 + PCM WAV (mono / stereo)",
         gfx::MUTED,
         1,
     );
@@ -807,7 +824,16 @@ fn page_audio_static(c: &mut Canvas, st: &AppStatus) {
 fn page_audio_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
     let card = Card::at(8, CONTENT_Y, 784, 384);
     let r = card.begin_dyn(c, 6, 56, 768, 100);
-    c.text(20, 150, &st.media_name, gfx::ACCENT, 2);
+    c.text(
+        20,
+        150,
+        st.media_name.rsplit('/').next().unwrap_or(&st.media_name),
+        gfx::ACCENT,
+        2,
+    );
+    if let Some((folder, _)) = st.media_name.rsplit_once('/') {
+        c.text(20, 168, path_suffix(folder, 94), gfx::MUTED, 1);
+    }
     c.text(
         20,
         180,
@@ -910,7 +936,7 @@ fn page_storage_static(c: &mut Canvas, st: &AppStatus) {
         784,
         480 - y - 156,
         c,
-        "Live SD root files (8.3 aliases; up to 64)",
+        "SD folders and files (FAT short aliases)",
     );
     for (x, label) in [(20, "PREVIOUS"), (192, "NEXT"), (364, "RESCAN SD")] {
         c.rect(x, 348, 164, 48, gfx::PANEL_HI);
@@ -927,9 +953,12 @@ fn page_storage_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         20,
         264,
         if st.sd_file_name.is_empty() {
-            "No files in SD root"
+            "No files on SD"
         } else {
-            &st.sd_file_name
+            st.sd_file_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(&st.sd_file_name)
         },
         gfx::ACCENT,
         2,
@@ -945,7 +974,10 @@ fn page_storage_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         },
         st.sd_file_count
     );
-    c.text(20, 292, &count, gfx::MUTED, 1);
+    c.text(20, 296, &count, gfx::MUTED, 1);
+    if let Some((folder, _)) = st.sd_file_name.rsplit_once('/') {
+        c.text(20, 282, path_suffix(folder, 94), gfx::MUTED, 1);
+    }
     c.text(20, 314, &st.media_status, gfx::TEXT, 1);
     d.push(Rect::new(20, 264, 760, 68)).ok();
     delete_controls(c, st, 348, d);
@@ -1024,9 +1056,12 @@ fn page_camera_dyn(c: &mut Canvas, st: &AppStatus, d: &mut Dirty) {
         364,
         264,
         if st.video_playing || st.video_recording {
-            &st.video_name
+            st.video_name.rsplit('/').next().unwrap_or(&st.video_name)
         } else {
-            &st.video_selected
+            st.video_selected
+                .rsplit('/')
+                .next()
+                .unwrap_or(&st.video_selected)
         },
         gfx::ACCENT,
         2,

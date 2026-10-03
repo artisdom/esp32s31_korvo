@@ -5,11 +5,11 @@ use crate::{
     pcm::{Format, Resampler, wav_header},
     storage::{Name, Storage},
 };
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::fmt::Write;
 use embedded_sdmmc::{Mode, RawFile};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Command {
     Next,
     Previous,
@@ -33,20 +33,25 @@ pub enum Command {
     VideoNext,
     VideoPrevious,
     PlayFile,
+    PlayNamed(Name),
 }
 pub struct Media {
     storage: Option<Storage>,
-    pub tracks: heapless::Vec<Name, 64>,
+    pub tracks: Vec<Name>,
     pub selected: usize,
-    pub files: heapless::Vec<Name, 64>,
+    pub files: Vec<Name>,
     pub file_selected: usize,
     pub delete_request: crate::delete_request::DeleteRequest<Name>,
     pub status: heapless::String<64>,
     pub last_recording: Option<Name>,
     player: Option<Player>,
+    pcm_worker: &'static crate::pcm_worker::Worker,
+    pcm_pending: bool,
+    decoded: Option<crate::mp3::AudioFrame>,
+    audio_generation: u32,
     video_player: Option<crate::video_player::Player>,
     video_decoder: &'static crate::jpeg_decoder::Worker,
-    pub videos: heapless::Vec<Name, 64>,
+    pub videos: Vec<Name>,
     pub video_selected: usize,
     pub last_video: Option<Name>,
     recorder: Option<Recorder>,
@@ -73,7 +78,10 @@ struct Player {
     resampler: Resampler,
     draining: bool,
     played_bytes: u64,
-    decoded_any: bool,
+    mp3: crate::mp3::Stream,
+    io_us: u64,
+    decode_us: u64,
+    resample_us: u64,
 }
 struct VideoRecorder {
     file: RawFile,
@@ -100,20 +108,25 @@ impl Media {
         storage: Option<Storage>,
         encoder: &'static crate::jpeg_worker::Worker,
         video_decoder: &'static crate::jpeg_decoder::Worker,
+        pcm_worker: &'static crate::pcm_worker::Worker,
     ) -> Self {
         let mut m = Self {
             storage,
-            tracks: heapless::Vec::new(),
+            tracks: Vec::new(),
             selected: 0,
-            files: heapless::Vec::new(),
+            files: Vec::new(),
             file_selected: 0,
             delete_request: crate::delete_request::DeleteRequest::new(),
             status: heapless::String::new(),
             last_recording: None,
             player: None,
+            pcm_worker,
+            pcm_pending: false,
+            decoded: None,
+            audio_generation: 0,
             video_player: None,
             video_decoder,
-            videos: heapless::Vec::new(),
+            videos: Vec::new(),
             video_selected: 0,
             last_video: None,
             recorder: None,
@@ -144,7 +157,7 @@ impl Media {
         self.tracks
             .get(self.selected)
             .map(|s| s.as_str())
-            .unwrap_or("No MP3/WAV files in SD root")
+            .unwrap_or("No MP3/WAV files on SD")
     }
     pub fn recording(&self) -> bool {
         self.recorder.is_some() || self.video.is_some()
@@ -154,6 +167,9 @@ impl Media {
     }
     pub fn playing(&self) -> bool {
         self.player.is_some() || self.video_playing()
+    }
+    pub fn audio_playing(&self) -> bool {
+        self.player.is_some()
     }
     pub fn video_playing(&self) -> bool {
         self.video_player.is_some()
@@ -184,27 +200,23 @@ impl Media {
         let selected_video = self.videos.get(self.video_selected).cloned();
         match self.storage.as_ref().map(|s| s.files()) {
             Some(Ok(files)) => {
-                match self.storage.as_ref().unwrap().tracks() {
-                    Ok(tracks) => self.tracks = tracks,
-                    Err(e) => {
-                        self.message(e);
-                        return;
-                    }
-                }
-                match self.storage.as_ref().unwrap().videos() {
-                    Ok(videos) => self.videos = videos,
-                    Err(e) => {
-                        self.message(e);
-                        return;
-                    }
-                }
+                self.tracks = files
+                    .iter()
+                    .filter(|n| n.ends_with(".MP3") || n.ends_with(".WAV"))
+                    .cloned()
+                    .collect();
+                self.videos = files
+                    .iter()
+                    .filter(|n| n.ends_with(".AVI"))
+                    .cloned()
+                    .collect();
                 self.video_selected = selected_video
                     .and_then(|name| self.videos.iter().position(|n| *n == name))
                     .unwrap_or_else(|| self.videos.len().saturating_sub(1));
                 self.files = files;
                 self.file_selected = self.file_selected.min(self.files.len().saturating_sub(1));
                 self.selected = self.selected.min(self.tracks.len().saturating_sub(1));
-                self.message("Ready (SD root, MP3 / PCM WAV)");
+                self.message("Ready (SD folders, MP3 / PCM WAV)");
             }
             Some(Err(e)) => self.message(e),
             None => self.message("SD FAT filesystem unavailable"),
@@ -215,6 +227,19 @@ impl Media {
             self.delete_request.cancel();
         }
         match cmd {
+            Command::PlayNamed(name) => {
+                self.stop(audio);
+                let result = if name.ends_with(".AVI") {
+                    self.start_video_playback(name, audio)
+                } else if name.ends_with(".MP3") || name.ends_with(".WAV") {
+                    self.start_playback(&name, audio)
+                } else {
+                    Err("Select an AVI / WAV / MP3 file")
+                };
+                if let Err(e) = result {
+                    self.message(e);
+                }
+            }
             Command::VideoNext | Command::VideoPrevious => {
                 if !self.videos.is_empty() {
                     self.video_selected = if matches!(cmd, Command::VideoNext) {
@@ -296,7 +321,8 @@ impl Media {
                             }
                             self.refresh();
                             let mut msg = heapless::String::<64>::new();
-                            let _ = write!(msg, "Deleted {}", name);
+                            let _ =
+                                write!(msg, "Deleted {}", name.rsplit('/').next().unwrap_or(&name));
                             self.message(&msg);
                         }
                         Err(e) => self.message(e),
@@ -596,6 +622,22 @@ impl Media {
                 "KORVOMP3.MP3",
                 include_bytes!("../tests/fixtures/demo.mp3").as_slice(),
             ),
+            (
+                "MP3HIGH.MP3",
+                include_bytes!("../tests/fixtures/high320.mp3").as_slice(),
+            ),
+            (
+                "MP3VBR.MP3",
+                include_bytes!("../tests/fixtures/vbr.mp3").as_slice(),
+            ),
+            (
+                "MP3LOW.MP3",
+                include_bytes!("../tests/fixtures/low8k.mp3").as_slice(),
+            ),
+            (
+                "MP3STRS.MP3",
+                include_bytes!("../tests/fixtures/high441.mp3").as_slice(),
+            ),
         ] {
             let file = match s.fs.open_file_in_dir(s.root, name, Mode::ReadWriteCreate) {
                 Ok(file) => file,
@@ -635,9 +677,7 @@ impl Media {
     }
     fn start_playback(&mut self, name: &Name, audio: &mut Audio) -> Result<(), &'static str> {
         let s = self.storage.as_ref().ok_or("No SD")?;
-        let file =
-            s.fs.open_file_in_dir(s.root, name.as_str(), Mode::ReadOnly)
-                .map_err(|_| "Cannot open track")?;
+        let file = s.open(name.as_str(), Mode::ReadOnly)?;
         let parsed = Self::parse_track(s, file, name);
         match parsed {
             Err(e) => {
@@ -646,23 +686,37 @@ impl Media {
             }
             Ok((format, remaining)) => {
                 esp_println::println!("play: {} format {:?} bytes {}", name, format, remaining);
+                let mut resampler = Resampler::default();
+                if let Some(f) = format {
+                    resampler.configure(f.rate);
+                }
                 self.player = Some(Player {
                     file,
                     format,
                     remaining,
                     input_len: 0,
-                    resampler: Resampler::default(),
+                    resampler,
                     draining: false,
                     played_bytes: 0,
-                    decoded_any: false,
+                    mp3: crate::mp3::Stream::default(),
+                    io_us: 0,
+                    decode_us: 0,
+                    resample_us: 0,
                 });
                 self.output_len = 0;
                 self.output_pos = 0;
                 self.seconds = 0;
-                *self.decoder = nanomp3_core::Decoder::new();
+                // The upstream readers use this in-place reset. Replacing the
+                // 22 KiB decoder by value creates large nested stack temporaries.
+                // nanomp3 pins the matching core internals to exactly 0.2.0.
+                nanomp3_core::__private::init(&mut self.decoder);
                 audio.set_source(Source::File);
                 let mut status = heapless::String::<64>::new();
-                let _ = write!(status, "Playing {}", name);
+                let _ = write!(
+                    status,
+                    "Playing {}",
+                    name.rsplit('/').next().unwrap_or(name)
+                );
                 self.message(&status);
                 Ok(())
             }
@@ -675,29 +729,21 @@ impl Media {
     ) -> Result<(Option<Format>, u32), &'static str> {
         let len = s.fs.file_length(file).map_err(|_| "File length")?;
         if name.ends_with(".MP3") {
-            let mut tag = [0u8; 10];
-            let n = s.fs.read(file, &mut tag).map_err(|_| "MP3 read")?;
-            let skip = if n == 10 && &tag[..3] == b"ID3" {
-                if tag[6..10].iter().any(|b| b & 128 != 0) {
-                    return Err("Invalid ID3 tag");
+            let mut skip = 0;
+            loop {
+                let mut tag = [0u8; 10];
+                let n = s.fs.read(file, &mut tag).map_err(|_| "MP3 read")?;
+                let size = crate::mp3::leading_tag(&tag[..n], len - skip)?;
+                s.fs.file_seek_from_start(file, skip + size)
+                    .map_err(|_| "MP3 seek")?;
+                if size == 0 {
+                    break;
                 }
-                10 + ((tag[6] as u32) << 21)
-                    + ((tag[7] as u32) << 14)
-                    + ((tag[8] as u32) << 7)
-                    + tag[9] as u32
-                    + if tag[3] == 4 && tag[5] & 16 != 0 {
-                        10
-                    } else {
-                        0
-                    }
-            } else {
-                0
-            };
+                skip += size;
+            }
             if skip >= len {
                 return Err("Empty MP3");
             }
-            s.fs.file_seek_from_start(file, skip)
-                .map_err(|_| "MP3 seek")?;
             return Ok((None, len - skip));
         }
         let mut header = [0u8; 12];
@@ -748,6 +794,8 @@ impl Media {
         Err("WAV has no data chunk")
     }
     pub fn stop(&mut self, audio: &mut Audio) {
+        self.audio_generation = self.audio_generation.wrapping_add(1);
+        self.decoded = None;
         if let Some(p) = self.video_player.take() {
             esp_println::println!(
                 "video playback stopped: {} last_frame={} decoded={} skipped={} elapsed={}s",
@@ -859,6 +907,47 @@ impl Media {
         }
     }
     pub fn poll(&mut self, audio: &mut Audio) {
+        // Only exchange a buffer after all its PCM has been copied to DMA.
+        // STOP invalidates jobs by generation, but still consumes the result.
+        if self.pcm_pending && self.output_pos >= self.output_len {
+            if let Some(done) = self.pcm_worker.take(&mut self.output) {
+                self.pcm_pending = false;
+                if done.generation == self.audio_generation {
+                    if let Some(p) = self.player.as_mut() {
+                        p.resample_us += done.elapsed_us;
+                        self.output_len = done.len;
+                        self.output_pos = 0;
+                        p.played_bytes += done.len as u64;
+                        self.seconds = (p.played_bytes / 192000) as u32;
+                        if done.finish {
+                            esp_println::println!(
+                                "MP3 complete: frames={} skipped={} gapless={} IO/decode/filter={} / {} / {} ms",
+                                p.mp3.frames,
+                                p.mp3.skipped,
+                                p.mp3.trimmed,
+                                p.io_us / 1000,
+                                p.decode_us / 1000,
+                                p.resample_us / 1000
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !self.pcm_pending {
+            if let Some(frame) = self.decoded.take() {
+                self.pcm_pending = self.pcm_worker.submit(
+                    &self.samples[frame.samples.clone()],
+                    frame.info.sample_rate,
+                    frame.info.channels.num() as usize,
+                    self.audio_generation,
+                    false,
+                );
+                if !self.pcm_pending {
+                    self.decoded = Some(frame);
+                }
+            }
+        }
         if let Some(player) = self.video_player.as_mut() {
             let result = player.poll(self.storage.as_ref().unwrap(), audio);
             self.seconds = player.seconds;
@@ -886,8 +975,15 @@ impl Media {
             return;
         }
         let p = self.player.as_mut().unwrap();
+        // Pipeline one decoded frame ahead of the second-core converter.
+        // A new WAV waits for any abandoned MP3 result to return its buffer.
+        if self.decoded.is_some()
+            || (self.pcm_pending && (p.format.is_some() || p.draining || p.mp3.complete()))
+        {
+            return;
+        }
         if p.draining {
-            if audio.queued() < 2048 {
+            if audio.queued() == 0 {
                 self.stop(audio);
                 self.message("Playback complete");
             }
@@ -904,9 +1000,10 @@ impl Media {
             self.output_pos = 0;
             if let Some(f) = p.format {
                 let count = (1024 * f.frame_bytes())
-                    .min(2048 / f.frame_bytes() * f.frame_bytes())
+                    .min(self.buffer.len())
                     .min(p.remaining as usize);
                 if count == 0 {
+                    self.output_len = p.resampler.finish(&mut self.output);
                     p.draining = true;
                     return Ok(());
                 }
@@ -929,8 +1026,28 @@ impl Media {
                             .frame(left, right, f.rate, &mut self.output[self.output_len..]);
                 }
             } else {
-                let need = (self.buffer.len() - p.input_len).min(p.remaining as usize);
+                if p.mp3.complete() {
+                    if p.mp3.frames == 0 {
+                        return Err("MP3 has no decodable audio");
+                    }
+                    if !self.pcm_pending {
+                        self.pcm_pending =
+                            self.pcm_worker
+                                .submit(&[], 0, 2, self.audio_generation, true);
+                        p.draining = self.pcm_pending;
+                    }
+                    return Ok(());
+                }
+                // Refill in large batches, preserving enough lookahead for
+                // three free-format frames between reads. Avoid a FAT/sector
+                // transaction after every individual MPEG frame.
+                let need = if p.input_len < 8192 {
+                    (self.buffer.len() - p.input_len).min(p.remaining as usize)
+                } else {
+                    0
+                };
                 if need > 0 {
+                    let read_start = esp_hal::time::Instant::now();
                     let n =
                         s.fs.read(p.file, &mut self.buffer[p.input_len..p.input_len + need])
                             .map_err(|_| "MP3 read failed")?;
@@ -939,60 +1056,87 @@ impl Media {
                     }
                     p.input_len += n;
                     p.remaining -= n as u32;
+                    p.io_us += read_start.elapsed().as_micros();
                 }
-                if p.input_len == 0 {
-                    if !p.decoded_any {
-                        return Err("MP3 has no decodable audio");
-                    }
-                    p.draining = true;
+                if p.remaining == 0 {
+                    p.input_len = p.mp3.strip_tail(&self.buffer[..p.input_len]);
+                } else if p.input_len < 8192 {
                     return Ok(());
                 }
-                let (consumed, info) = self
-                    .decoder
-                    .decode(&self.buffer[..p.input_len], &mut self.samples);
+                if p.input_len == 0 {
+                    if p.mp3.frames == 0 {
+                        return Err("MP3 has no decodable audio");
+                    }
+                    if !self.pcm_pending {
+                        self.pcm_pending =
+                            self.pcm_worker
+                                .submit(&[], 0, 2, self.audio_generation, true);
+                        p.draining = self.pcm_pending;
+                    }
+                    return Ok(());
+                }
+                let decode_start = esp_hal::time::Instant::now();
+                let (consumed, frame) = p.mp3.decode(
+                    &mut self.decoder,
+                    &self.buffer[..p.input_len],
+                    p.remaining == 0,
+                    &mut self.samples,
+                )?;
+                p.decode_us += decode_start.elapsed().as_micros();
                 if consumed == 0 {
                     if p.remaining == 0 {
-                        if !p.decoded_any {
+                        if p.mp3.frames == 0 {
                             return Err("MP3 has no decodable audio");
                         }
-                        p.draining = true;
+                        if !self.pcm_pending {
+                            self.pcm_pending =
+                                self.pcm_worker
+                                    .submit(&[], 0, 2, self.audio_generation, true);
+                            p.draining = self.pcm_pending;
+                        }
                         return Ok(());
                     }
                     return Err("Invalid MP3 frame");
                 }
                 self.buffer.copy_within(consumed..p.input_len, 0);
                 p.input_len -= consumed;
-                if let Ok(info) = info {
-                    if p.played_bytes == 0 {
+                if let Some(frame) = frame {
+                    let info = frame.info;
+                    if p.mp3.frames == 1 {
                         esp_println::println!(
-                            "MP3 decoded: {} Hz {} channels",
+                            "MP3 decoded: {} Hz {} channels {} kbps",
                             info.sample_rate,
-                            info.channels.num()
+                            info.channels.num(),
+                            info.bitrate
                         );
                     }
-                    let channels = info.channels.num() as usize;
-                    for frame in
-                        self.samples[..info.samples_produced * channels].chunks_exact(channels)
-                    {
-                        self.output_len += p.resampler.frame(
-                            frame[0],
-                            frame[if channels == 2 { 1 } else { 0 }],
-                            info.sample_rate,
-                            &mut self.output[self.output_len..],
-                        );
+                    if !frame.samples.is_empty() {
+                        if self.pcm_pending {
+                            self.decoded = Some(frame);
+                        } else {
+                            self.pcm_pending = self.pcm_worker.submit(
+                                &self.samples[frame.samples],
+                                info.sample_rate,
+                                info.channels.num() as usize,
+                                self.audio_generation,
+                                false,
+                            );
+                        }
                     }
                 }
             }
-            p.decoded_any |= self.output_len > 0;
-            p.played_bytes += self.output_len as u64;
-            self.seconds = (p.played_bytes / 192000) as u32;
             Ok::<_, &'static str>(())
         })();
         if let Err(e) = result {
             self.stop(audio);
             self.message(e);
-        } else if self.output_len > 0 {
-            self.output_pos = audio.queue(&self.output[..self.output_len]);
+        } else {
+            let p = self.player.as_mut().unwrap();
+            p.played_bytes += self.output_len as u64;
+            self.seconds = (p.played_bytes / 192000) as u32;
+            if self.output_len > 0 {
+                self.output_pos = audio.queue(&self.output[..self.output_len]);
+            }
         }
     }
 }

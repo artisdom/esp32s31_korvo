@@ -1,6 +1,9 @@
-//! FAT adapter for the async native SDMMC card. Creates recordings and deletes explicitly confirmed root files.
+//! FAT adapter for native SDMMC, recursive media paths and confirmed deletion.
 use crate::{fat_layout::Layout, sdcard::CardDevice};
+extern crate alloc;
+pub use crate::fat_files::Name;
 use aligned::{A4, Aligned};
+use alloc::vec::Vec;
 use core::{cell::RefCell, fmt, fmt::Write};
 use embedded_sdmmc::{
     Block, BlockCount, BlockDevice, BlockIdx, Mode, RawDirectory, RawFile, TimeSource, Timestamp,
@@ -22,14 +25,23 @@ pub struct Device {
 impl Device {
     pub fn new(card: &'static mut CardDevice) -> Result<Self, &'static str> {
         let blocks = card.card().csd.block_count() as u32;
-        let mut b = Aligned::<A4, _>([0u8; 512]);
-        embassy_futures::block_on(block_device_driver::BlockDevice::read(
-            card,
-            0,
-            core::slice::from_mut(&mut b),
-        ))
-        .map_err(|_| "SD read")?;
-        let layout = Layout::detect(&b, blocks);
+        let layout = Layout::read(blocks, |index, bytes| {
+            let mut aligned = Aligned::<A4, _>([0u8; 512]);
+            embassy_futures::block_on(block_device_driver::BlockDevice::read(
+                &mut *card,
+                index,
+                core::slice::from_mut(&mut aligned),
+            ))
+            .map_err(|_| "SD partition read")?;
+            bytes.copy_from_slice(&aligned[..]);
+            Ok(())
+        })?;
+        esp_println::println!(
+            "FAT layout: offset={} sectors={} FAT{}",
+            layout.offset,
+            layout.blocks,
+            if layout.fat32 { 32 } else { 16 }
+        );
         Ok(Self {
             card: RefCell::new(card),
             layout,
@@ -93,7 +105,6 @@ impl TimeSource for Clock {
         }
     }
 }
-pub type Name = heapless::String<13>;
 pub struct Storage {
     pub fs: VolumeManager<Device, Clock>,
     pub root: RawDirectory,
@@ -108,46 +119,14 @@ impl Storage {
         let root = fs.open_root_dir(volume).map_err(|_| "FAT root")?;
         Ok(Self { fs, root })
     }
-    pub fn tracks(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
-        self.list_files(1)
+    pub fn files(&self) -> Result<Vec<Name>, &'static str> {
+        crate::fat_files::catalog(&self.fs, self.root)
     }
-    pub fn files(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
-        self.list_files(0)
+    pub fn open(&self, path: &str, mode: Mode) -> Result<RawFile, &'static str> {
+        crate::fat_files::open(&self.fs, self.root, path, mode)
     }
-    pub fn videos(&self) -> Result<heapless::Vec<Name, 64>, &'static str> {
-        self.list_files(2)
-    }
-    fn list_files(&self, filter: u8) -> Result<heapless::Vec<Name, 64>, &'static str> {
-        let mut out = heapless::Vec::new();
-        self.fs
-            .iterate_dir(self.root, |entry| {
-                if !entry.attributes.is_directory() && !entry.attributes.is_volume() {
-                    let mut name = Name::new();
-                    let _ = write!(name, "{}", entry.name);
-                    if filter == 0
-                        || (filter == 1 && (name.ends_with(".WAV") || name.ends_with(".MP3")))
-                        || (filter == 2 && name.ends_with(".AVI"))
-                    {
-                        let _ = out.push(name);
-                    }
-                }
-                core::ops::ControlFlow::Continue(())
-            })
-            .map_err(|_| "directory read")?;
-        Ok(out)
-    }
-    pub fn delete(&self, name: &str) -> Result<(), &'static str> {
-        let entry = self
-            .fs
-            .find_directory_entry(self.root, name)
-            .map_err(|_| "File no longer available")?;
-        if entry.attributes.is_directory() || entry.attributes.is_volume() {
-            return Err("Only root files can be deleted");
-        }
-        self.fs.delete_entry_in_dir(self.root, name).map_err(|e| {
-            esp_println::println!("FAT delete {}: {:?}", name, e);
-            "Delete failed - RESCAN SD"
-        })
+    pub fn delete(&self, path: &str) -> Result<(), &'static str> {
+        crate::fat_files::delete(&self.fs, self.root, path)
     }
     pub fn create_recording(&self) -> Result<(RawFile, Name), &'static str> {
         self.create_numbered("REC", "WAV")

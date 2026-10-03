@@ -64,7 +64,14 @@ The Embassy source checkout is pinned at upstream commit
 `ae258ddd1b2a45715aef5ac12a70434b94e96139`. Patches add FS/LS-only controller
 mode, correct UTMI frame timing, safe cancellation of interrupt/control IN
 buffers, PRE control-stage spacing, selected HID interface construction and
-preservation of simultaneous hub-port changes. Runtime time crates stay on the
+preservation of simultaneous hub-port changes. S31 also enables the PHY
+PRE_HPHY_LSIE bit, selects the 16-bit UTMI interface, and serializes transfers
+with a full-frame recovery gap. Retry loops release the lock before yielding
+so idle HID polling cannot starve descriptor requests. Bounded channel halts
+and cancellation guards revoke IN buffers and stop cancelled OUT tokens.
+Composite interface setup is serialized and completes before its polling starts;
+short report descriptors are retried rather than accepted as complete.
+Runtime time crates stay on the
 published versions compatible with esp-rtos/embassy-executor; using the newer
 checkout's timer-driver ABI stalled the first startup delay during bring-up.
 
@@ -82,17 +89,42 @@ retained in `src/usb_device.rs`; it is not the default Type-A behavior.
 
 ## Validation (2026-10-03)
 
-- 25 host application tests passed, including seven HID/input tests for
-  edge-triggered actions, multiple keyboards, unplug release, rollover,
-  Shift/Caps/Backspace, report IDs, short reports, signed 16-bit mouse axes,
-  wheel movement and NKRO bitmaps, plus the existing media regression tests.
-- 83 Embassy USB-host unit tests passed.
-- Release host + Wi-Fi/BLE and legacy CDC builds passed.
-- Board startup, SD mount, Wi-Fi association/DHCP and BLE advertising passed
-  with the host enabled. Camera AVI playback decoded all 55 frames of
-  `VID00013.AVI` with zero skipped frames; LCD underruns remained zero.
-- **Peripheral verification pending:** the captured UART run reported zero
-  hubs/keyboards/mice and no root attach event. The user has a hub, keyboard
-  and mouse available; enumeration, typing, clicking and hotplug still require
-  those devices to be connected and tested. This is not yet a claim of verified
-  USB peripheral operation on this board.
+- 26 host application tests passed at the USB-only stage, including the
+  captured VID 4e53 / PID 5407 report descriptor with packed signed 12-bit X/Y,
+  report ID 1, five buttons, wheel, short-report rejection and click edges.
+  The later MP3/SD changes expand the same application test suite.
+- 83 Embassy USB-host tests and five controller tests passed. Controller tests
+  cover bounded halts, cancelled RX buffer ownership, PRE spacing, NAK fairness
+  and serialization of FS hub tokens with LS traffic.
+- Release host + Wi-Fi/BLE and legacy CDC builds pass.
+- The connected hub is two cascaded FS hubs (214b:7250), with a low-speed
+  keyboard (1a2c:4782) and mouse (4e53:5407). Both child devices enumerate in
+  the Rust build after the S31 PHY correction and retry-lock fairness fix.
+- The mouse originally received three-byte boot reports whose report ID was
+  interpreted as a button and packed Y bytes as the only axis. Serialized
+  SET_PROTOCOL/GET_DESCRIPTOR setup now obtains its 66-byte descriptor and
+  six-byte report packets. Captures show both axes; host tests verify packed
+  axis decoding and button edges. Physical typing/click/hotplug confirmation
+  remains pending on the final production build.
+- The mouse's auxiliary keyboard/vendor interface can return BadResponse on
+  endpoint 2; the pointer interface is separate. UART `usb` reports HID
+  interface counts, which can exceed the number of physical peripherals.
+- Verbose descriptor logging is opt-in (`--features usb-diagnostics`). It holds
+  the UART critical section long enough to cause LCD underruns, and one verbose
+  run faulted in the radio timer context. Production builds leave this logging
+  disabled; a 55-second production run remained responsive with zero LCD
+  underruns, Wi-Fi DHCP and BLE advertising.
+
+Hardware diagnostics first reproduced the downstream failure using Espressif's
+current USB-host driver (`esp-usb` ef27ceb) in FS/LS-only mode. Buffer and
+scatter/gather DMA did not resolve it. PHY probes isolated FC_06 bit 2:
+parallel LS modes 5/7 enumerate both devices; modes 0/1/2/3/6 do not. The
+production firmware remains fully Rust and uses the existing PIO host driver.
+The temporary vendor diagnostic was not added to the application.
+
+To run controller checks in the patched checkout:
+
+```sh
+cargo +stable test --manifest-path embassy-usb-synopsys-otg/Cargo.toml --target x86_64-unknown-linux-gnu --features host
+cargo +stable test --manifest-path embassy-usb-host/Cargo.toml --target x86_64-unknown-linux-gnu
+```

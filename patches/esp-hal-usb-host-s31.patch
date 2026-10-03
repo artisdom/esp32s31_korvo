@@ -27,10 +27,10 @@ index 30eee205f..fa8f7b99b 100644
              phy_type: info.phy_type,
              calculate_trdt_fn: |_| 5,
 diff --git a/esp-hal/src/usb/otg/embassy_usb_host.rs b/esp-hal/src/usb/otg/embassy_usb_host.rs
-index d49d1894a..60060230d 100644
+index d49d1894a..e650eaf48 100644
 --- a/esp-hal/src/usb/otg/embassy_usb_host.rs
 +++ b/esp-hal/src/usb/otg/embassy_usb_host.rs
-@@ -15,6 +15,14 @@ pub struct Driver<'d> {
+@@ -15,6 +15,19 @@ pub struct Driver<'d> {
  }
  
  impl<'d> Driver<'d> {
@@ -39,12 +39,35 @@ index d49d1894a..60060230d 100644
 +    pub fn new_full_speed(peri: Usb<'d>) -> Self {
 +        let mut driver = Self::new(peri);
 +        driver.inner.set_full_speed_only();
++        #[cfg(esp32s31)]
++        {
++            driver.inner.set_utmi_16_bit(true);
++            driver.inner.set_serialized_transactions(true);
++        }
 +        driver
 +    }
 +
      /// Creates a new host controller driver for embassy-usb-host.
      pub fn new(peri: Usb<'d>) -> Self {
          let i = peri.info();
+diff --git a/esp-hal/src/usb/otg/ll/esp32s31.rs b/esp-hal/src/usb/otg/ll/esp32s31.rs
+index 4ff420556..8dcfa723e 100644
+--- a/esp-hal/src/usb/otg/ll/esp32s31.rs
++++ b/esp-hal/src/usb/otg/ll/esp32s31.rs
+@@ -46,7 +46,12 @@ fn hs_init() {
+     const USB_UTMI: usize = 0x2038_0000;
+     let fc_06 = (USB_UTMI as *mut u32).wrapping_add(6);
+     // SAFETY: USB_HS ownership provides exclusive access to the UTMI PHY.
+-    unsafe { fc_06.write_volatile(fc_06.read_volatile() | (1 << 3) | (1 << 0)) };
++    // S31 low-speed devices behind a full-speed hub require PRE_HPHY_LSIE.
++    // Without it the first downstream SETUP fails with a transaction error.
++    // Verified with both the Rust PIO host and the Espressif descriptor-DMA host.
++    unsafe {
++        fc_06.write_volatile((fc_06.read_volatile() & !(1 << 1)) | (1 << 3) | (1 << 2) | (1 << 0))
++    };
+ }
+ 
+ fn connect_hs_pulldowns(connect: bool) {
 diff --git a/esp-hal/src/usb/otg/mod.rs b/esp-hal/src/usb/otg/mod.rs
 index 884b9d777..bea8878b7 100644
 --- a/esp-hal/src/usb/otg/mod.rs

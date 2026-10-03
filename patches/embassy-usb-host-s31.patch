@@ -37,7 +37,7 @@ index 8ca4ac2..89a7ae0 100644
              addr: EndpointAddress::from_parts(0, UsbDirection::In),
              ep_type: EndpointType::Control,
 diff --git a/embassy-usb-host/src/class/hub.rs b/embassy-usb-host/src/class/hub.rs
-index 090f5e1..77a88aa 100644
+index 090f5e1..24d519a 100644
 --- a/embassy-usb-host/src/class/hub.rs
 +++ b/embassy-usb-host/src/class/hub.rs
 @@ -28,6 +28,10 @@ const PORT_ENABLE_POLLS: u32 = 10;
@@ -93,8 +93,23 @@ index 090f5e1..77a88aa 100644
                  trace!("HUB {}: port {} changed, requesting status", self.device_address, port);
  
                  let (status, mut change) = self.get_port_status(port).await?;
+@@ -370,6 +380,14 @@ impl<'d, A: UsbHostAllocator<'d>, const MAX_PORTS: usize> HubHandler<'d, A, MAX_
+         Ok((info, config_len))
+     }
+ 
++    /// Disable a downstream port after a failed/cancelled enumeration.
++    ///
++    /// `port` is zero-based. An enabled child left at the default address can
++    /// collide with the next child's enumeration on another hub or port.
++    pub async fn disable_port(&mut self, port: u8) -> Result<(), HostError> {
++        self.port_feature(false, PortFeature::Enable, port, 0).await
++    }
++
+     async fn port_feature(&mut self, set: bool, feature: PortFeature, port: u8, selector: u8) -> Result<(), HostError> {
+         let setup = SetupPacket {
+             request_type: RequestType {
 diff --git a/embassy-usb-synopsys-otg/Cargo.toml b/embassy-usb-synopsys-otg/Cargo.toml
-index 820720d..882e40e 100644
+index 820720d..2930d02 100644
 --- a/embassy-usb-synopsys-otg/Cargo.toml
 +++ b/embassy-usb-synopsys-otg/Cargo.toml
 @@ -38,7 +38,7 @@ portable-atomic = { version = "1" }
@@ -106,23 +121,86 @@ index 820720d..882e40e 100644
  embassy-usb-driver = { version = "0.2.2", path = "../embassy-usb-driver" }
  
  defmt = { version = "1.0.1", optional = true }
+@@ -54,3 +54,9 @@ host = ["embassy-time"]
+ 
+ ## Enables remote wakeup support in device mode.
+ embassy-time = ["dep:embassy-time"]
++
++[dev-dependencies]
++critical-section = { version = "1.2", features = ["std"] }
++embassy-time = { version = "0.5.1", features = ["std", "generic-queue-8"] }
++embassy-futures = "0.1"
++futures-executor = "0.3"
 diff --git a/embassy-usb-synopsys-otg/src/host.rs b/embassy-usb-synopsys-otg/src/host.rs
-index f7e00de..032ca18 100644
+index f7e00de..c234c8f 100644
 --- a/embassy-usb-synopsys-otg/src/host.rs
 +++ b/embassy-usb-synopsys-otg/src/host.rs
-@@ -438,6 +438,7 @@ where
+@@ -68,6 +68,7 @@ struct HostStateFields {
+     port_waker: AtomicWaker,
+     port_event: AtomicU8,
+     port_speed: AtomicU8,
++    serialize_transactions: AtomicBool,
+ }
+ 
+ /// Storage object for USB host driver state. Create one per OTG instance.
+@@ -78,6 +79,7 @@ where
+     channels: [ChannelState; CH_COUNT],
+     fields: HostStateFields,
+     mutex: M,
++    preamble: embassy_sync::mutex::Mutex<M, ()>,
+ }
+ 
+ impl<const CH_COUNT: usize, M> HostStateStorage<CH_COUNT, M>
+@@ -101,8 +103,10 @@ where
+                 port_waker: AtomicWaker::new(),
+                 port_event: AtomicU8::new(0),
+                 port_speed: AtomicU8::new(0),
++                serialize_transactions: AtomicBool::new(false),
+             },
+             mutex,
++            preamble: embassy_sync::mutex::Mutex::new(()),
+         }
+     }
+ 
+@@ -112,6 +116,7 @@ where
+             channels: self.channels.as_slice(),
+             fields: &self.fields,
+             mutex: &self.mutex,
++            preamble: &self.preamble,
+         }
+     }
+ }
+@@ -126,6 +131,7 @@ where
+     channels: &'d [ChannelState],
+     fields: &'d HostStateFields,
+     mutex: &'d M,
++    preamble: &'d embassy_sync::mutex::Mutex<M, ()>,
+ }
+ 
+ impl<'d, M> Clone for HostState<'d, M>
+@@ -137,6 +143,7 @@ where
+             channels: self.channels,
+             fields: self.fields,
+             mutex: self.mutex,
++            preamble: self.preamble,
+         }
+     }
+ }
+@@ -438,6 +445,8 @@ where
  {
      instance: OtgHostInstance<'d, M>,
      inited: bool,
 +    full_speed_only: bool,
++    utmi_16_bit: Option<bool>,
  }
  
  impl<'d, M> OtgHost<'d, M>
-@@ -449,9 +450,16 @@ where
+@@ -449,9 +458,33 @@ where
          Self {
              instance,
              inited: false,
 +            full_speed_only: false,
++            utmi_16_bit: None,
          }
      }
  
@@ -132,21 +210,40 @@ index f7e00de..032ca18 100644
 +        self.full_speed_only = true;
 +    }
 +
++    /// Select the platform UTMI width when the core supports both widths.
++    pub fn set_utmi_16_bit(&mut self, enabled: bool) {
++        self.utmi_16_bit = Some(enabled);
++    }
++
++    /// Serialize FS hub traffic with LS PRE traffic on platforms whose PHY
++    /// cannot safely interleave these host channels. Opt-in; other controllers
++    /// retain parallel channels.
++    pub fn set_serialized_transactions(&mut self, enabled: bool) {
++        self.instance
++            .state
++            .fields
++            .serialize_transactions
++            .store(enabled, Ordering::Release);
++    }
++
      async fn configure_as_host(&self) {
          let r = self.instance.regs;
          let phy_type = self.instance.phy_type;
-@@ -497,6 +505,10 @@ where
+@@ -497,6 +530,13 @@ where
              w.set_fdmod(false);
              // Enable internal full-speed PHY
              w.set_physel(phy_type.internal() && !phy_type.high_speed());
 +            if phy_type == PhyType::InternalHighSpeed {
 +                w.set_ulpi_utmi_sel(false);
-+                w.set_phyif(r.hwcfg4().read().utmi_phy_data_width() == 1);
++                w.set_phyif(self.utmi_16_bit.unwrap_or(r.hwcfg4().read().utmi_phy_data_width() == 1));
++                if self.utmi_16_bit.is_some() {
++                    w.set_tocal(5);
++                }
 +            }
          });
  
          // Wait for host mode to take effect (~25ms).
-@@ -519,6 +531,7 @@ where
+@@ -519,6 +559,7 @@ where
          // fslspcs=0: 30/60 MHz (HS PHY); fslspcs=1: 48 MHz (FS PHY).
          r.hcfg().modify(|w| {
              w.set_fslspcs(if self.instance.phy_type.high_speed() { 0 } else { 1 });
@@ -154,7 +251,7 @@ index f7e00de..032ca18 100644
          });
  
          // Configure FIFO sizes for host mode:
-@@ -659,6 +672,7 @@ where
+@@ -659,6 +700,7 @@ where
                      ep_number,
                      max_packet_size,
                      is_low_speed,
@@ -162,7 +259,7 @@ index f7e00de..032ca18 100644
                      data_toggle: false,
                      phantom: PhantomData,
                  });
-@@ -735,6 +749,9 @@ where
+@@ -735,6 +777,9 @@ where
                  return DeviceEvent::Disconnected;
              }
  
@@ -172,7 +269,7 @@ index f7e00de..032ca18 100644
              // Connected: perform bus reset.
              self.bus_reset().await;
  
-@@ -792,7 +809,12 @@ where
+@@ -792,7 +837,12 @@ where
                          Speed::Full | Speed::Low => {
                              // Both FS and LS use 1 ms frame intervals.
                              // PHY clock: HS PHY = 60 MHz, FS PHY = 48 MHz.
@@ -186,17 +283,17 @@ index f7e00de..032ca18 100644
                              r.hfir().write(|w| w.set_frivl(frivl));
                          }
                          Speed::High => {} // Keep HS defaults
-@@ -874,6 +896,32 @@ where
+@@ -874,6 +924,32 @@ where
      }
  }
  
-+/// On cancellation, revoke the ISR buffer pointer before its borrow ends.
-+struct RxGuard<'d, M: RawMutex + Copy> {
++/// On cancellation, halt the transaction and revoke any ISR buffer borrow.
++struct TransferGuard<'d, M: RawMutex + Copy> {
 +    regs: Otg,
 +    state: HostState<'d, M>,
 +    index: usize,
 +}
-+impl<M: RawMutex + Copy> Drop for RxGuard<'_, M> {
++impl<M: RawMutex + Copy> Drop for TransferGuard<'_, M> {
 +    fn drop(&mut self) {
 +        self.state.mutex.lock(|| {
 +            let ch = &self.state.channels[self.index];
@@ -219,7 +316,7 @@ index f7e00de..032ca18 100644
  /// A USB host channel for performing transfers.
  ///
  /// The channel is automatically released when dropped.
-@@ -890,6 +938,7 @@ where
+@@ -890,6 +966,7 @@ where
      ep_number: u8,
      max_packet_size: u16,
      is_low_speed: bool,
@@ -227,10 +324,75 @@ index f7e00de..032ca18 100644
      data_toggle: bool,
      phantom: PhantomData<(T, D)>,
  }
-@@ -1096,15 +1145,6 @@ where
-         }
+@@ -964,23 +1041,6 @@ where
+             self.is_low_speed,
+         );
+ 
+-        // The DWC2 does not auto-clear CHENA after transfer completion.
+-        // If the channel is still active from a previous transfer, we
+-        // must explicitly halt it and wait for the hardware to confirm
+-        // (CHENA cleared) before reconfiguring. Without this, writing
+-        // new HCCHAR/HCTSIZ while the channel is active causes undefined
+-        // behavior — typically a permanent hang or stale interrupts.
+-        if r.hcchar(ch).read().chena() {
+-            r.hcchar(ch).modify(|w| {
+-                w.set_chena(true);
+-                w.set_chdis(true);
+-            });
+-            while r.hcchar(ch).read().chena() {
+-                core::hint::spin_loop();
+-            }
+-            r.hcint(ch).write_value(crate::otg_v1::regs::Hcint(0xFFFF_FFFF));
+-        }
+-
+         // Configure channel characteristics
+         let is_periodic = matches!(ep_type, EndpointType::Interrupt | EndpointType::Isochronous);
+         r.hcchar(ch).write(|w| {
+@@ -1051,9 +1111,8 @@ where
+         });
      }
  
+-    /// Halt and spin until CHENA clears. No-op if already disabled (no CHH would
+-    /// be raised, so awaiting one would park forever). Drains any halt CHH.
+-    fn halt_channel(&self) {
++    /// Settle a previous transfer without blocking the executor indefinitely.
++    async fn halt_channel(&self) -> Result<(), PipeError> {
+         let r = self.regs;
+         let ch = self.index;
+         if r.hcchar(ch).read().chena() {
+@@ -1061,12 +1120,17 @@ where
+                 w.set_chena(true);
+                 w.set_chdis(true);
+             });
++            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(5);
+             while r.hcchar(ch).read().chena() {
+-                core::hint::spin_loop();
++                if embassy_time::Instant::now() >= deadline {
++                    return Err(PipeError::BadResponse);
++                }
++                embassy_time::Timer::after_micros(125).await;
+             }
+         }
+         r.hcint(ch).write_value(crate::otg_v1::regs::Hcint(0xFFFF_FFFF));
+         self.state.channels[ch].result.store(0, Ordering::Release);
++        Ok(())
+     }
+ 
+     fn write_fifo(&self, data: &[u8]) {
+@@ -1089,20 +1153,13 @@ where
+ 
+     fn setup_rx_buffer(&self, buf: &mut [u8]) {
+         let ch_state = &self.state.channels[self.index];
+-        unsafe {
+-            *ch_state.rx_buffer.get() = buf.as_mut_ptr();
++        self.state.mutex.lock(|| unsafe {
++            // Publish the complete pointer/count/capacity tuple atomically
++            // with respect to the RX FIFO interrupt, including stale packets.
+             *ch_state.rx_count.get() = 0;
+             *ch_state.rx_capacity.get() = buf.len();
+-        }
+-    }
+-
 -    fn clear_rx_buffer(&self) {
 -        let ch_state = &self.state.channels[self.index];
 -        unsafe {
@@ -238,30 +400,90 @@ index f7e00de..032ca18 100644
 -            *ch_state.rx_count.get() = 0;
 -            *ch_state.rx_capacity.get() = 0;
 -        }
--    }
--
-     fn rx_count(&self) -> usize {
-         unsafe { *self.state.channels[self.index].rx_count.get() }
++            *ch_state.rx_buffer.get() = buf.as_mut_ptr();
++        });
      }
-@@ -1178,7 +1218,12 @@ where
+ 
+     fn rx_count(&self) -> usize {
+@@ -1168,6 +1225,24 @@ where
+         // rewrites HCTSIZ each iteration so we re-assert it here.
+         let mut do_ping = false;
+         loop {
++            // ESP UTMI hardware cannot issue two PRE transactions in one frame.
++            // Serialize all LS-via-FS channels, including retries, and leave a
++            // full frame after the previous channel releases the lock. Starting
++            // the delay here also covers cancellation of a pending transfer.
++            let serialized = self.preamble || self.state.fields.serialize_transactions.load(Ordering::Acquire);
++            let _preamble = if serialized {
++                let guard = self.state.preamble.lock().await;
++                embassy_time::Timer::after_millis(1).await;
++                Some(guard)
++            } else {
++                None
++            };
++            self.halt_channel().await?;
++            let guard = TransferGuard {
++                regs: self.regs,
++                state: self.state,
++                index: self.index,
++            };
+             self.configure_channel(false, ep_type, pktcnt, data.len() as u32, dpid);
+             if do_ping {
+                 self.regs.hctsiz(self.index).modify(|w| w.set_doping(true));
+@@ -1177,8 +1252,15 @@ where
+             self.write_fifo(data);
  
              let events = self.wait_for_result().await;
++            drop(guard);
++            drop(_preamble);
++            if serialized {
++                yield_now().await;
++            }
              match Self::classify_events(events) {
 -                ChannelEvent::Complete => return Ok(()),
 +                ChannelEvent::Complete => {
-+                    if self.preamble {
-+                        embassy_time::Timer::after_millis(1).await;
-+                    }
 +                    return Ok(());
 +                }
                  ChannelEvent::Nyet => {
                      do_ping = true;
                      yield_now().await;
-@@ -1218,15 +1263,25 @@ where
+@@ -1188,7 +1270,20 @@ where
+                     yield_now().await;
+                     continue;
+                 }
+-                ChannelEvent::Error(e) => return Err(e),
++                ChannelEvent::Error(e) => {
++                    warn!(
++                        "transfer error {:?}: addr={} ep={} low={} PRE={} events={:#x} hcchar={:#x} hctsiz={:#x}",
++                        e,
++                        self.device_address,
++                        self.ep_number,
++                        self.is_low_speed,
++                        self.preamble,
++                        events,
++                        self.regs.hcchar(self.index).read().0,
++                        self.regs.hctsiz(self.index).read().0
++                    );
++                    return Err(e);
++                }
+             }
+         }
+     }
+@@ -1217,25 +1312,58 @@ where
+         };
  
          loop {
++            let serialized = self.preamble || self.state.fields.serialize_transactions.load(Ordering::Acquire);
++            let _preamble = if serialized {
++                let guard = self.state.preamble.lock().await;
++                embassy_time::Timer::after_millis(1).await;
++                Some(guard)
++            } else {
++                None
++            };
++            self.halt_channel().await?;
              self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
-+            let guard = RxGuard {
++            let guard = TransferGuard {
 +                regs: self.regs,
 +                state: self.state,
 +                index: self.index,
@@ -273,18 +495,221 @@ index f7e00de..032ca18 100644
              let count = self.rx_count();
 -            self.clear_rx_buffer();
 +            drop(guard);
++            drop(_preamble);
++            if serialized {
++                yield_now().await;
++            }
  
              match Self::classify_events(events) {
 -                ChannelEvent::Complete => return Ok(count),
 +                ChannelEvent::Complete => {
-+                    if self.preamble {
-+                        embassy_time::Timer::after_millis(1).await;
-+                    }
 +                    return Ok(count);
 +                }
                  ChannelEvent::Nak | ChannelEvent::Nyet | ChannelEvent::Halted | ChannelEvent::None => {
                      // Periodic channels auto-halt after NAK; settle before retry.
                      if is_periodic {
+-                        self.halt_channel();
++                        self.halt_channel().await?;
+                     }
+                     yield_now().await;
+                     continue;
+                 }
+-                ChannelEvent::Error(e) => return Err(e),
++                ChannelEvent::Error(e) => {
++                    warn!(
++                        "transfer error {:?}: addr={} ep={} low={} PRE={} events={:#x} hcchar={:#x} hctsiz={:#x}",
++                        e,
++                        self.device_address,
++                        self.ep_number,
++                        self.is_low_speed,
++                        self.preamble,
++                        events,
++                        self.regs.hcchar(self.index).read().0,
++                        self.regs.hctsiz(self.index).read().0
++                    );
++                    return Err(e);
++                }
+             }
+         }
+     }
+@@ -1409,3 +1537,177 @@ async fn yield_now() {
+     })
+     .await
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use core::pin::Pin;
++    use core::task::{Context, Waker};
++    use embassy_usb_driver::{Direction, EndpointAddress};
++    use std::{boxed::Box, thread, time::Duration as StdDuration};
++
++    fn poll_once<F: core::future::Future>(f: Pin<&mut F>) -> Poll<F::Output> {
++        f.poll(&mut Context::from_waker(Waker::noop()))
++    }
++    fn control_endpoint() -> EndpointInfo {
++        EndpointInfo {
++            addr: EndpointAddress::from_parts(0, Direction::In),
++            ep_type: EndpointType::Control,
++            max_packet_size: 8,
++            interval_ms: 0,
++        }
++    }
++    #[test]
++    fn stuck_halt_times_out_without_blocking_other_futures() {
++        let mut memory = Box::new([0u32; 512]);
++        // SAFETY: the register window is aligned, live and exclusively owned here.
++        let regs = unsafe { Otg::from_ptr(memory.as_mut_ptr().cast()) };
++        let storage = HostStateStorage::<1>::new(CriticalSectionRawMutex::new());
++        let alloc = OtgHostAllocator {
++            regs,
++            state: storage.as_host_state(),
++        };
++        let channel = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(1, &control_endpoint(), None)
++            .unwrap();
++        regs.hcchar(0).modify(|w| w.set_chena(true));
++        let mut progressed = false;
++        let (result, ()) = futures_executor::block_on(embassy_futures::join::join(channel.halt_channel(), async {
++            embassy_time::Timer::after_micros(1).await;
++            progressed = true;
++        }));
++        assert_eq!(result, Err(PipeError::BadResponse));
++        assert!(progressed);
++    }
++    #[test]
++    fn pending_old_halt_does_not_publish_new_rx_buffer() {
++        let mut memory = Box::new([0u32; 512]);
++        let regs = unsafe { Otg::from_ptr(memory.as_mut_ptr().cast()) };
++        let storage = HostStateStorage::<1>::new(CriticalSectionRawMutex::new());
++        let alloc = OtgHostAllocator {
++            regs,
++            state: storage.as_host_state(),
++        };
++        let mut channel = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(1, &control_endpoint(), None)
++            .unwrap();
++        regs.hcchar(0).modify(|w| w.set_chena(true));
++        let mut packet = [0; 8];
++        let mut transfer = Box::pin(channel.do_in_transfer(EndpointType::Control, &mut packet, 0));
++        assert!(poll_once(transfer.as_mut()).is_pending());
++        // No packet from the previous transaction may target this caller's buffer.
++        assert!(unsafe { *storage.channels[0].rx_buffer.get() }.is_null());
++        drop(transfer);
++        assert!(unsafe { *storage.channels[0].rx_buffer.get() }.is_null());
++    }
++    #[test]
++    fn preamble_channels_serialize_and_cancel_with_a_fresh_frame_gap() {
++        let mut memory = Box::new([0u32; 512]);
++        let regs = unsafe { Otg::from_ptr(memory.as_mut_ptr().cast()) };
++        let storage = HostStateStorage::<2>::new(CriticalSectionRawMutex::new());
++        let alloc = OtgHostAllocator {
++            regs,
++            state: storage.as_host_state(),
++        };
++        let route = Some(SplitInfo::new(1, 1, SplitSpeed::Low));
++        let mut first = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(2, &control_endpoint(), route)
++            .unwrap();
++        let mut second = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(3, &control_endpoint(), route)
++            .unwrap();
++        // Empty OUT packets avoid touching the simulated FIFO window.
++        let mut a = Box::pin(first.do_out_transfer(EndpointType::Control, &[], 0));
++        let mut b = Box::pin(second.do_out_transfer(EndpointType::Control, &[], 0));
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(poll_once(b.as_mut()).is_pending());
++        thread::sleep(StdDuration::from_millis(2));
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(regs.hcchar(0).read().chena());
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(!regs.hcchar(1).read().chena());
++        drop(a);
++        assert!(regs.hcchar(0).read().chdis()); // cancellation requests a halt
++        regs.hcchar(0).modify(|w| w.set_chena(false)); // hardware finishes halting
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(!regs.hcchar(1).read().chena()); // next channel waits a fresh frame
++        thread::sleep(StdDuration::from_millis(2));
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(regs.hcchar(1).read().chena());
++        drop(b);
++        assert!(regs.hcchar(1).read().chdis());
++    }
++    #[test]
++    fn preamble_nak_releases_lock_before_yielding_to_other_channels() {
++        let mut memory = Box::new([0u32; 512]);
++        let regs = unsafe { Otg::from_ptr(memory.as_mut_ptr().cast()) };
++        let storage = HostStateStorage::<2>::new(CriticalSectionRawMutex::new());
++        let alloc = OtgHostAllocator {
++            regs,
++            state: storage.as_host_state(),
++        };
++        let route = Some(SplitInfo::new(1, 1, SplitSpeed::Low));
++        let mut first = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(2, &control_endpoint(), route)
++            .unwrap();
++        let mut second = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(3, &control_endpoint(), route)
++            .unwrap();
++        let mut a = Box::pin(first.do_out_transfer(EndpointType::Control, &[], 0));
++        let mut b = Box::pin(second.do_out_transfer(EndpointType::Control, &[], 0));
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(poll_once(b.as_mut()).is_pending());
++        thread::sleep(StdDuration::from_millis(2));
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(regs.hcchar(0).read().chena());
++        regs.hcchar(0).modify(|w| w.set_chena(false));
++        storage.channels[0].result.store(EV_NAK, Ordering::Release);
++        assert!(poll_once(a.as_mut()).is_pending());
++        // Unlike a yield while holding the mutex, the waiting channel now
++        // gets the next turn, so an idle keyboard cannot starve enumeration.
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(poll_once(a.as_mut()).is_pending());
++        thread::sleep(StdDuration::from_millis(2));
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(regs.hcchar(1).read().chena());
++        assert!(!regs.hcchar(0).read().chena());
++    }
++
++    #[test]
++    fn serialized_bus_keeps_full_speed_hub_tokens_out_of_low_speed_transfers() {
++        let mut memory = Box::new([0u32; 512]);
++        let regs = unsafe { Otg::from_ptr(memory.as_mut_ptr().cast()) };
++        let storage = HostStateStorage::<2>::new(CriticalSectionRawMutex::new());
++        storage.fields.serialize_transactions.store(true, Ordering::Release);
++        let alloc = OtgHostAllocator {
++            regs,
++            state: storage.as_host_state(),
++        };
++        let mut fs = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(1, &control_endpoint(), None)
++            .unwrap();
++        let mut ls = alloc
++            .alloc_pipe::<pipe::Control, pipe::InOut>(
++                2,
++                &control_endpoint(),
++                Some(SplitInfo::new(1, 1, SplitSpeed::Low)),
++            )
++            .unwrap();
++        let mut a = Box::pin(fs.do_out_transfer(EndpointType::Control, &[], 0));
++        let mut b = Box::pin(ls.do_out_transfer(EndpointType::Control, &[], 0));
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(poll_once(b.as_mut()).is_pending());
++        thread::sleep(StdDuration::from_millis(2));
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(regs.hcchar(0).read().chena());
++        assert!(!regs.hcchar(1).read().chena());
++        regs.hcchar(0).modify(|w| w.set_chena(false));
++        storage.channels[0].result.store(EV_XFRC, Ordering::Release);
++        assert!(poll_once(a.as_mut()).is_pending());
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(poll_once(a.as_mut()).is_ready());
++        thread::sleep(StdDuration::from_millis(2));
++        assert!(poll_once(b.as_mut()).is_pending());
++        assert!(regs.hcchar(1).read().chena());
++    }
++}
 diff --git a/embassy-usb/Cargo.toml b/embassy-usb/Cargo.toml
 index e698673..d32d3ff 100644
 --- a/embassy-usb/Cargo.toml

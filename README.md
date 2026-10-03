@@ -23,7 +23,7 @@ the USB-C serial console (115200 8N1), and then runs a 800x480 UI on the LCD:
 | microSD | SDMMC 4-bit @ 20 MHz, power switch GPIO39 | `esp_hal::sdmmc` + `sdio` + `embedded-sdmmc` | **works** on the 128 GB FAT32 card: file playback, new numbered WAV recordings, and read-only boot inspection |
 | WS2812 status LED | GPIO37 | `esp_hal::rmt` | **disabled at user request** — black latched once at startup; no animation or button feedback |
 | Buttons | 4-key resistor ladder on GPIO42 (ADC1_CH0**_N**) | `esp_hal::analog::adc` + vendor raw→mV mapping (`buttons.rs`) | **works** — VOL+/VOL-/MODE/SET; direct weighted-code conversion and 20 ms debouncing |
-| USB hub / keyboard / mouse | Type-A, native USB_HS PHY | Rust Embassy USB host, FS/LS bus | **implemented; peripheral testing pending** — USB page, typing, mouse cursor/clicks, hub hotplug; see [USB host](doc/17-usb-host-input.md) |
+| USB hub / keyboard / mouse | Type-A, native USB_HS PHY | Rust Embassy USB host, FS/LS bus | hub/child enumeration and packed mouse reports verified; final input confirmation pending — USB page, typing, cursor/clicks, hub hotplug; see [USB host](doc/17-usb-host-input.md) |
 | DVP camera | SC101IOT (SCCB 0x68 on the shared I2C) | `camera.rs`: paged SCCB + DVP RX, Rust JPEG and AVI | live 320x240 preview and MJPEG + stereo microphone AVI recording; on-board AVI playback; SD file also decoded on host |
 | PSRAM | 16 MB hex @ 250 MHz | `esp_hal::psram` + `esp-alloc` | **works** — heap region, framebuffer lives here |
 | Dual core | 2x RISC-V | `esp_rtos::start_second_core` | **works** — core 0: UI/audio/input; core 1: JPEG + USB tasks |

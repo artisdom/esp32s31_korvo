@@ -826,6 +826,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embassy-usb-driver",
+ "log",
  "portable-atomic",
 ]
 
@@ -1734,6 +1735,7 @@ dependencies = [
  "embassy-usb",
  "embassy-usb-driver",
  "embassy-usb-host",
+ "embassy-usb-synopsys-otg",
  "embedded-sdmmc",
  "esp-alloc",
  "esp-backtrace",
@@ -1747,6 +1749,7 @@ dependencies = [
  "ieee802154",
  "jpeg-encoder",
  "libm",
+ "log",
  "nanomp3-core",
  "sdio",
  "static_cell",

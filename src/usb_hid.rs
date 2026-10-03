@@ -112,6 +112,37 @@ mod tests {
         assert_eq!(i.pop(), None);
     }
     #[test]
+    fn captured_4e53_5407_mouse_report_id_and_packed_axes() {
+        // Descriptor captured from the user's composite mouse. Its report ID
+        // and two packed 12-bit axes cannot be decoded as a boot mouse packet.
+        let d = ReportDescriptor::<64>::parse(&[
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09,
+            0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
+            0x95, 0x01, 0x75, 0x03, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x00,
+            0xf8, 0x26, 0xff, 0x07, 0x75, 0x0c, 0x95, 0x02, 0x81, 0x06, 0x09, 0x38, 0x15, 0x81,
+            0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xc0, 0xc0,
+        ]);
+        let mut i = Input::new();
+        // ID 1, left + middle, X=-200, Y=300, wheel=-1.
+        decode(&d, &[1, 5, 0x38, 0xcf, 0x12, 0xff], &mut i, 0);
+        assert_eq!(i.snapshot.mouse, Some((200, 479)));
+        assert_eq!(i.snapshot.buttons, 5);
+        assert_eq!(i.snapshot.wheel, -1);
+        assert_eq!(i.pop(), Some(Event::Click(200, 479)));
+        // Right button, X=300, Y=-1; no additional left-click event.
+        decode(&d, &[1, 2, 0x2c, 0xf1, 0xff, 0], &mut i, 0);
+        assert_eq!(i.snapshot.mouse, Some((500, 478)));
+        assert_eq!(i.snapshot.buttons, 2);
+        assert_eq!(i.pop(), None);
+        for report in [&[1, 0, 0, 0, 0][..], &[2, 0, 0, 0, 0, 0][..], &[][..]] {
+            decode(&d, report, &mut i, 0);
+            assert_eq!(i.snapshot.mouse, Some((500, 478)));
+            assert_eq!(i.snapshot.buttons, 2);
+        }
+        decode(&d, &[1, 0, 0, 0, 0, 0], &mut i, 0);
+        assert_eq!(i.snapshot.buttons, 0);
+    }
+    #[test]
     fn nkro_bitmap() {
         let d = ReportDescriptor::<64>::parse(&[
             0x05, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81, 2,

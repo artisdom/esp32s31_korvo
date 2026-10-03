@@ -47,5 +47,6 @@ apply_once() {
 apply_once "$sys_checkout" "$repo_root/patches/esp-wifi-sys-s31-classic.patch"
 apply_once "$hal_checkout" "$repo_root/patches/esp-radio-classic-s31.patch"
 "$repo_root/scripts/apply-radio-affinity-fix.sh" "$hal_checkout"
+"$repo_root/scripts/apply-fpu-context-fix.sh" "$hal_checkout"
 printf '%s\n' 'Classic discovery patches applied; commit them in the dependency checkouts.'
 printf '%s\n' 'Cargo.toml paths must match the selected checkout locations.'

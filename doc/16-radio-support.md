@@ -375,5 +375,41 @@ using the application’s local USB OTG, driver and sync patches. Sustained
 Wi-Fi/BLE + MP3 + USB hardware validation remains pending.
 
 A separate source audit found no floating-point registers or `fcsr` in the
-RISC-V RTOS `CpuContext`; this possible imafc multitasking issue has not been
-changed by the affinity workaround and needs its own evidence and tests.
+RISC-V RTOS `CpuContext`. The separate hardware diagnostic and fix below
+address this independently of the affinity workaround.
+
+## S31 floating-point task context
+
+A separate hardware diagnostic proved that FP state was missing from RTOS
+switches: two equal-priority tasks pinned to CPU 0 exchanged their callee-saved
+`fs0` values across a delay, failing 507 of 1,000 checks. CPU affinity alone
+cannot fix this. The original RISC-V context contained integer registers only,
+while the S31 application uses the hard-float `riscv32imafc` target.
+
+External HAL commit `ed0ead6c1` appends all 32 FP registers and `fcsr` to the S31
+context. Existing integer offsets remain unchanged and have compile-time layout
+assertions. The trampoline saves FP state before invoking scheduler Rust code
+and restores it even when the selected task does not change. The idle path
+preserves FP state on its interrupted stack. S31 task contexts grow 132 bytes
+and aligned interrupt frames grow 144 bytes; other chips keep their original
+context and 80-byte interrupt frame. This addresses the RTOS switch boundary;
+the separate SMP publication-order workaround remains necessary.
+
+Apply `scripts/apply-fpu-context-fix.sh [esp-hal-checkout]` to reproduce
+`patches/esp-rtos-fpu-context-s31.patch`. Classic and BTDM setup also invoke the
+script. Fresh-checkout application, repeat application, exact source comparison,
+shell syntax and whitespace checks pass. The S31 release diagnostic builds, and
+an ESP32-C6 non-F target passes both `cargo check` and a release library build
+to verify the unchanged-chip path through assembly code generation.
+
+An isolated ignored project at `target/fpu-diagnostic` expands the hardware
+probe to `f0`–`f31` plus distinct valid `fcsr` rounding modes and exception flags.
+Its assembly loads distinct task patterns, spins across timer preemption using
+only integer operations, captures every FP register and `fcsr`, then restores
+its caller's original state. There are no normal function calls inside that
+interval, so caller-saved FP registers cannot be legitimately overwritten by a
+Rust call. Two CPU-0-pinned tasks perform 6,600 comparisons. Immutable pre-fix
+and fixed firmware are `target/lcd-debug/korvo-fpu-all-baseline.elf` and
+`target/lcd-debug/korvo-fpu-all-fixed.elf`; the fixed expected UART result is
+`FPU RESULT: checks=6600 failures=0 PASS`. Expanded hardware confirmation and
+combined media/radio endurance validation remain pending.

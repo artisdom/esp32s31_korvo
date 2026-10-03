@@ -11,3 +11,4 @@ else
     printf '%s\n' 'Applied BTDM internal-memory fix. Commit it in the dependency checkout.'
 fi
 "$repo_root/scripts/apply-radio-affinity-fix.sh" "$checkout"
+"$repo_root/scripts/apply-fpu-context-fix.sh" "$checkout"

@@ -1,0 +1,248 @@
+diff --git a/esp-rtos/src/task/riscv.rs b/esp-rtos/src/task/riscv.rs
+index ec27e891b..e0f6f2b29 100644
+--- a/esp-rtos/src/task/riscv.rs
++++ b/esp-rtos/src/task/riscv.rs
+@@ -86,8 +86,21 @@ pub struct CpuContext {
+     /// Program counter, stores the address of the next instruction to be
+     /// executed.
+     pub pc: usize,
++    /// S31 imafc task state. Keep this after the fixed integer context offsets.
++    #[cfg(esp32s31)]
++    pub fp: [u32; 32],
++    /// Floating-point rounding mode and accrued exception flags.
++    #[cfg(esp32s31)]
++    pub fcsr: u32,
+ }
+ 
++#[cfg(esp32s31)]
++const _: () = {
++    assert!(core::mem::offset_of!(CpuContext, pc) == 31 * 4);
++    assert!(core::mem::offset_of!(CpuContext, fp) == 32 * 4);
++    assert!(core::mem::offset_of!(CpuContext, fcsr) == 64 * 4);
++};
++
+ impl CpuContext {
+     /// Creates a new, zeroed out context.
+     pub const fn new() -> Self {
+@@ -180,7 +193,7 @@ unsafe extern "C" fn swint_handler_trampoline() {
+ 
+         # Reserve enough stack space for the idle context. A running task saves
+         # directly into its CpuContext instead, avoiding duplicate stores.
+-        addi sp, sp, -80 # RISC-V requires 16-byte alignment
++        addi sp, sp, -{interrupt_stack_size} # RISC-V requires 16-byte alignment
+ 
+         sw tp, 0*4(sp)
+         bnez tp, 1f
+@@ -203,6 +216,46 @@ unsafe extern "C" fn swint_handler_trampoline() {
+         sw a5, 14*4(sp)
+         sw a6, 15*4(sp)
+         sw a7, 16*4(sp)
++        .if {save_fp}
++        .option push
++        .option arch, +f
++        # Idle has no task context. Preserve FP before scheduler Rust code.
++        fsw f0, 80(sp)
++        fsw f1, 84(sp)
++        fsw f2, 88(sp)
++        fsw f3, 92(sp)
++        fsw f4, 96(sp)
++        fsw f5, 100(sp)
++        fsw f6, 104(sp)
++        fsw f7, 108(sp)
++        fsw f8, 112(sp)
++        fsw f9, 116(sp)
++        fsw f10, 120(sp)
++        fsw f11, 124(sp)
++        fsw f12, 128(sp)
++        fsw f13, 132(sp)
++        fsw f14, 136(sp)
++        fsw f15, 140(sp)
++        fsw f16, 144(sp)
++        fsw f17, 148(sp)
++        fsw f18, 152(sp)
++        fsw f19, 156(sp)
++        fsw f20, 160(sp)
++        fsw f21, 164(sp)
++        fsw f22, 168(sp)
++        fsw f23, 172(sp)
++        fsw f24, 176(sp)
++        fsw f25, 180(sp)
++        fsw f26, 184(sp)
++        fsw f27, 188(sp)
++        fsw f28, 192(sp)
++        fsw f29, 196(sp)
++        fsw f30, 200(sp)
++        fsw f31, 204(sp)
++        csrr t0, fcsr
++        sw t0, 208(sp)
++        .option pop
++        .endif
+         j 2f
+ 
+ 1:
+@@ -223,6 +276,46 @@ unsafe extern "C" fn swint_handler_trampoline() {
+         sw a5, 13*4(tp)
+         sw a6, 14*4(tp)
+         sw a7, 15*4(tp)
++        .if {save_fp}
++        .option push
++        .option arch, +f
++        # Save all FP state before publishing the task to the scheduler.
++        fsw f0, 128(tp)
++        fsw f1, 132(tp)
++        fsw f2, 136(tp)
++        fsw f3, 140(tp)
++        fsw f4, 144(tp)
++        fsw f5, 148(tp)
++        fsw f6, 152(tp)
++        fsw f7, 156(tp)
++        fsw f8, 160(tp)
++        fsw f9, 164(tp)
++        fsw f10, 168(tp)
++        fsw f11, 172(tp)
++        fsw f12, 176(tp)
++        fsw f13, 180(tp)
++        fsw f14, 184(tp)
++        fsw f15, 188(tp)
++        fsw f16, 192(tp)
++        fsw f17, 196(tp)
++        fsw f18, 200(tp)
++        fsw f19, 204(tp)
++        fsw f20, 208(tp)
++        fsw f21, 212(tp)
++        fsw f22, 216(tp)
++        fsw f23, 220(tp)
++        fsw f24, 224(tp)
++        fsw f25, 228(tp)
++        fsw f26, 232(tp)
++        fsw f27, 236(tp)
++        fsw f28, 240(tp)
++        fsw f29, 244(tp)
++        fsw f30, 248(tp)
++        fsw f31, 252(tp)
++        csrr t0, fcsr
++        sw t0, 256(tp)
++        .option pop
++        .endif
+ 
+ 2:
+         # Let's run the interrupt handler, which runs the scheduler. If the scheduler
+@@ -236,6 +329,45 @@ unsafe extern "C" fn swint_handler_trampoline() {
+         bnez t0, 3f
+         bnez tp, 3f
+ 
++        .if {save_fp}
++        .option push
++        .option arch, +f
++        flw f0, 80(sp)
++        flw f1, 84(sp)
++        flw f2, 88(sp)
++        flw f3, 92(sp)
++        flw f4, 96(sp)
++        flw f5, 100(sp)
++        flw f6, 104(sp)
++        flw f7, 108(sp)
++        flw f8, 112(sp)
++        flw f9, 116(sp)
++        flw f10, 120(sp)
++        flw f11, 124(sp)
++        flw f12, 128(sp)
++        flw f13, 132(sp)
++        flw f14, 136(sp)
++        flw f15, 140(sp)
++        flw f16, 144(sp)
++        flw f17, 148(sp)
++        flw f18, 152(sp)
++        flw f19, 156(sp)
++        flw f20, 160(sp)
++        flw f21, 164(sp)
++        flw f22, 168(sp)
++        flw f23, 172(sp)
++        flw f24, 176(sp)
++        flw f25, 180(sp)
++        flw f26, 184(sp)
++        flw f27, 188(sp)
++        flw f28, 192(sp)
++        flw f29, 196(sp)
++        flw f30, 200(sp)
++        flw f31, 204(sp)
++        lw t0, 208(sp)
++        csrw fcsr, t0
++        .option pop
++        .endif
+         lw ra, 1*4(sp)
+         lw t1, 3*4(sp)
+         lw t2, 4*4(sp)
+@@ -252,13 +384,13 @@ unsafe extern "C" fn swint_handler_trampoline() {
+         lw a6, 15*4(sp)
+         lw a7, 16*4(sp)
+         lw t0, 2*4(sp)
+-        addi sp, sp, 80
++        addi sp, sp, {interrupt_stack_size}
+         mret
+ 
+ 3:
+         # Free the interrupt stack before saving the old task's SP or loading
+         # the selected context.
+-        addi sp, sp, 80
++        addi sp, sp, {interrupt_stack_size}
+ 
+         # If the thread pointer has not changed, just restore caller-saved registers
+         beq t0, tp, 5f # Skip to restoring caller-saved registers in the new context
+@@ -313,6 +445,47 @@ unsafe extern "C" fn swint_handler_trampoline() {
+         # written to a CpuContext, so there is nothing to reload.
+         beqz tp, 6f
+ 
++        .if {save_fp}
++        .option push
++        .option arch, +f
++        # Restore even when the same task remains selected: scheduler Rust
++        # may use caller-saved FP registers. Restore fcsr after FP loads.
++        flw f0, 128(tp)
++        flw f1, 132(tp)
++        flw f2, 136(tp)
++        flw f3, 140(tp)
++        flw f4, 144(tp)
++        flw f5, 148(tp)
++        flw f6, 152(tp)
++        flw f7, 156(tp)
++        flw f8, 160(tp)
++        flw f9, 164(tp)
++        flw f10, 168(tp)
++        flw f11, 172(tp)
++        flw f12, 176(tp)
++        flw f13, 180(tp)
++        flw f14, 184(tp)
++        flw f15, 188(tp)
++        flw f16, 192(tp)
++        flw f17, 196(tp)
++        flw f18, 200(tp)
++        flw f19, 204(tp)
++        flw f20, 208(tp)
++        flw f21, 212(tp)
++        flw f22, 216(tp)
++        flw f23, 220(tp)
++        flw f24, 224(tp)
++        flw f25, 228(tp)
++        flw f26, 232(tp)
++        flw f27, 236(tp)
++        flw f28, 240(tp)
++        flw f29, 244(tp)
++        flw f30, 248(tp)
++        flw f31, 252(tp)
++        lw t0, 256(tp)
++        csrw fcsr, t0
++        .option pop
++        .endif
+         lw ra, 0*4(tp)
+         lw t0, 1*4(tp)
+         lw t1, 2*4(tp)
+@@ -338,6 +511,8 @@ unsafe extern "C" fn swint_handler_trampoline() {
+         .cfi_endproc
+         ",
+         scheduler_interrupt_handler = sym swint_handler,
++        save_fp = const cfg!(esp32s31) as usize,
++        interrupt_stack_size = const if cfg!(esp32s31) { 224 } else { 80 },
+     }
+ }
+ 
